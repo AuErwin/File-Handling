@@ -215,6 +215,9 @@ class UndoManager(object):
         if payload is None:
             report.messages.append("Undo log %s is unreadable or corrupted." % target_path)
             return report
+        if payload.get("dry_run"):
+            report.messages.append("This is a simulation log; no file operation can be restored.")
+            return report
 
         raw_actions: Sequence[Dict[str, Any]] = payload.get("actions", []) or []
         if limit is not None and limit >= 0:

@@ -20,6 +20,18 @@ python -m pip install -r requirements.txt
 
 Windows PowerShell 激活命令：`.venv\Scripts\Activate.ps1`。使用 Python 3.8 或更新版本；旧 `myenv` 是本地生成的 Windows 环境，不适合跨平台复用。
 
+## 图形界面
+
+项目内的 `file_organizer/gui.py` 和根目录 `run_gui.py` 已就位。从项目根目录启动：
+
+```bash
+python run_gui.py
+# 或
+python -m file_organizer.gui
+```
+
+GUI 使用 Tkinter。在 Homebrew Python 3.14 下若提示缺少 `_tkinter`，先运行 `brew install python-tk@3.14`，再用 `python -m tkinter` 检查是否能打开测试窗口。界面提供文件浏览、扫描、分类预览与选择、查重、空目录、大/小文件、撤销、分类规则和设置。“文件浏览”页可查看所选目录及其子目录，选中文件可预览前 64 KiB 的 UTF-8 文本；Word、PDF、图片等非文本文件需用系统应用打开。该页只读取文件，不修改内容。大/小文件页显示每个文件的实际大小和它占所选目录文件总大小的百分比；也可将手动选中的文件移入回收站，操作前会要求确认。“撤销历史”只显示当前目标文件夹的记录，切换文件夹后需重新选择记录；模拟操作不会生成可撤销日志。
+
 配置、AI 缓存和撤销日志默认保存在 `~/.file_organizer/`。要将这三项一起放到其他目录，在子命令前使用 `--work-dir`：
 
 ```bash
@@ -83,6 +95,7 @@ file_organizer/
 │   ├── __init__.py
 │   ├── __main__.py          # python -m file_organizer 入口
 │   ├── main.py              # argparse 子命令与编排
+│   ├── gui.py               # Tkinter 图形界面与文件浏览
 │   ├── models.py            # FileInfo / ScanResult / PlannedAction 等数据模型
 │   ├── config.py            # config.json 加载、校验与默认值
 │   ├── storage.py           # SQLite AI 缓存（失败自动降级为内存字典）
@@ -93,6 +106,7 @@ file_organizer/
 │   ├── executor.py          # 冲突改名 / DELETE 二次确认 / 软删除 / undo 日志
 │   ├── undo.py              # 读取 undo_log 回滚，冲突自动改名
 │   └── utils.py             # 编码、格式化、哈希、路径工具
+├── run_gui.py                # 图形界面入口
 └── requirements.txt
 ```
 

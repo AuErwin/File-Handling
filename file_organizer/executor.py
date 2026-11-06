@@ -282,7 +282,8 @@ class Executor(object):
                 report.failed += 1
 
         report.actions = executed
-        report.log_path = self.write_undo_log(executed)
+        if not self.dry_run:
+            report.log_path = self.write_undo_log(executed)
         return report
 
     def _do_move(self, item: PlannedAction, report: ExecutionReport) -> None:
