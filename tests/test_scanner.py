@@ -4,7 +4,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Tuple
 
+import pytest
+
 from file_organizer.config import Config
+from file_organizer.models import FileInfo
 from file_organizer.scanner import Scanner
 
 
@@ -63,3 +66,28 @@ def test_scan_extension_distribution(tmp_path: Path) -> None:
     extensions = [info.extension for info in result.files]
     assert extensions.count(".pdf") == 2
     assert extensions.count(".jpg") == 1
+
+
+def test_scan_excludes_explicit_paths(tmp_path: Path) -> None:
+    root, config = _scan_root(tmp_path)
+    blocked = root / "blocked"
+    blocked.mkdir()
+    (blocked / "secret.txt").write_text("skip", encoding="utf-8")
+    (root / "keep.txt").write_text("keep", encoding="utf-8")
+
+    result = Scanner(root, config=config, exclude_paths={str(blocked)}).scan()
+
+    assert [item.name for item in result.files] == ["keep.txt"]
+    assert str(blocked) in result.excluded_dirs
+
+
+def test_scan_records_file_that_vanishes_before_stat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, config = _scan_root(tmp_path)
+    path = root / "vanishing.txt"
+    path.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(FileInfo, "from_path", classmethod(lambda cls, file_path: None))
+
+    result = Scanner(root, config=config).scan()
+
+    assert result.files == []
+    assert result.skipped_files == [(str(path), "stat failed")]

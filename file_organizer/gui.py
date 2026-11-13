@@ -1063,7 +1063,7 @@ class App(tk.Tk):
         def work() -> Tuple[List[FileInfo], int, int]:
             result = self.scan_tree(root, excludes)
             if largest:
-                picked = Cleaner.find_large_files(result.files, top)
+                picked = sorted(result.files, key=lambda i: (-i.size, str(i.path)))[:top]
             else:
                 picked = sorted(result.files, key=lambda i: (i.size, str(i.path)))[:top]
             return picked, len(result.files), result.total_size

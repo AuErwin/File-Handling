@@ -153,7 +153,6 @@ class Executor(object):
                 else:
                     item.status = "failed"
                     item.message = "unknown action '%s'" % item.action
-                    report.failed += 1
             except KeyboardInterrupt:
                 item.status = "failed"
                 item.message = "interrupted by user"
@@ -192,12 +191,11 @@ class Executor(object):
         destination = Path(item.destination)
         if destination.exists() and destination.is_dir():
             destination = destination / source.name
-        destination = self.resolve_conflict(destination)
-
         if self._same_path(source, destination):
             item.status = "skipped"
             item.message = "source and destination are identical"
             return
+        destination = self.resolve_conflict(destination)
 
         item.destination = destination
         if self.dry_run:

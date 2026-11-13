@@ -33,5 +33,7 @@ jobs:
       - name: Lint (flake8)
         run: flake8 file_organizer run_gui.py tests
 
-      - name: Run tests
-        run: pytest -v
+      - name: Run tests and measure coverage
+        run: |
+          coverage run --source=file_organizer -m pytest -v
+          coverage report --skip-covered --fail-under=60

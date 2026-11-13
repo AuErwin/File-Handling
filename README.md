@@ -107,8 +107,9 @@ AI 只在“整理归类 → 生成预览”中参与分类：先按扩展名规
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -v
-flake8
+coverage run --source=file_organizer -m pytest -v
+coverage report --skip-covered --fail-under=60
+flake8 file_organizer run_gui.py tests
 ```
 
-测试全部在临时目录中运行，不会读写 `~/.file_organizer/`。`.github/workflows/ci.yml` 在每次 push 或 Pull Request 时于 Python 3.9–3.12 上运行 flake8 和 pytest。
+测试全部在临时目录中运行，不会读写 `~/.file_organizer/`。`.github/workflows/ci.yml` 在每次 push 或 Pull Request 时于 Python 3.9–3.12 上运行 flake8、pytest 和覆盖率检查。。

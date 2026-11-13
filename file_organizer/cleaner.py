@@ -46,10 +46,10 @@ class Cleaner(object):
         # topdown=False guarantees children are visited before their parent.
         for dirpath, dirnames, filenames in os.walk(str(base), topdown=False, onerror=lambda e: None):
             key = os.path.normcase(os.path.abspath(dirpath))
-            if key in guard:
+            if any(part in skip_names for part in Path(dirpath).relative_to(base).parts):
                 removable[key] = False
                 continue
-            if os.path.basename(os.path.normpath(dirpath)) in skip_names:
+            if key in guard:
                 removable[key] = False
                 continue
             children_all_removable = True
