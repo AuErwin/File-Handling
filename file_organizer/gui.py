@@ -2,7 +2,7 @@
 
 启动方式::
 
-    python run_gui.py            # 放在 file_organizer 文件夹的上一级
+    python main.py               # 放在 file_organizer 文件夹的上一级
 
 界面使用 Tkinter，并直接复用业务模块：
 Scanner / Classifier / DuplicateChecker / Cleaner / Executor / UndoManager。

@@ -31,7 +31,7 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Lint (flake8)
-        run: flake8 file_organizer run_gui.py tests
+        run: flake8 file_organizer main.py tests
 
       - name: Run tests
         run: pytest -v

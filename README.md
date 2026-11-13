@@ -24,10 +24,10 @@ Windows PowerShell 激活命令：`.venv\Scripts\Activate.ps1`。
 从项目根目录运行：
 
 ```bash
-python run_gui.py
+python main.py
 ```
 
-Windows 下想不弹出命令行窗口，可将 `run_gui.py` 重命名为 `run_gui.pyw` 后双击。
+Windows 下想不弹出命令行窗口，可使用 `pythonw main.py`。
 
 GUI 使用 Tkinter。在 Homebrew Python 3.14 下若提示缺少 `_tkinter`，先运行 `brew install python-tk@3.14`，再用 `python -m tkinter` 检查是否能打开测试窗口。
 
@@ -44,7 +44,7 @@ GUI 使用 Tkinter。在 Homebrew Python 3.14 下若提示缺少 `_tkinter`，�
 ## 目录结构
 
 ```
-├── run_gui.py                # 图形界面入口
+├── main.py                   # 项目入口
 ├── tests/                    # pytest 自动化测试（扫描/分类/查重/撤销）
 ├── .github/workflows/ci.yml  # GitHub Actions：flake8 + pytest
 ├── .flake8                   # 风格检查配置
@@ -108,7 +108,7 @@ AI 只在“整理归类 → 生成预览”中参与分类：先按扩展名规
 ```bash
 pip install -r requirements-dev.txt
 pytest -v
-flake8 file_organizer run_gui.py tests
+flake8 file_organizer main.py tests
 ```
 
 测试全部在临时目录中运行，不会读写 `~/.file_organizer/`。`.github/workflows/ci.yml` 在每次 push 或 Pull Request 时于 Python 3.9–3.12 上运行 flake8 和 pytest。
