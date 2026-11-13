@@ -977,7 +977,7 @@ class App(tk.Tk):
         root = self.get_root()
         if root is None:
             return
-        excludes = self.extra_excludes()
+        excludes = self.extra_excludes() | set(self.config.excluded_names)
         protected = {str(root), str(self.trash_dir_for(root))}
 
         def work() -> List[Path]:

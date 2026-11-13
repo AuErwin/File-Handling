@@ -5,7 +5,7 @@ Guarantees
 * **Never overwrite.**  When the destination exists, a timestamp (then an index)
   is appended: ``report.pdf`` -> ``report_20231027.pdf`` -> ``report_20231027_1.pdf``.
 * **Never delete directly.**  ``delete`` moves the file into a recycle bin.
-* **Always reversible.**  Every run writes ``undo_log_<timestamp>.json``.
+* **Undoable on successful logging.**  Every run saves a unique undo log.
 * The GUI confirms destructive batches before calling this engine.
 """
 
@@ -16,6 +16,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from uuid import uuid4
 
 from .config import Config
 from .models import ACTION_DELETE, ACTION_MOVE, ACTION_RMDIR, PlannedAction
@@ -84,7 +85,7 @@ class Executor(object):
         )
         base_log = Path(str(log_dir)) if log_dir else (Path.home() / ".file_organizer" / "undo_logs")
         self.log_dir: Path = base_log
-        self.batch_id: str = timestamp_slug()
+        self.batch_id: str = "%s_%s" % (timestamp_slug(), uuid4().hex)
 
     # ------------------------------------------------------------------ #
     # Naming helpers
@@ -139,7 +140,7 @@ class Executor(object):
         if not actions:
             return report
 
-        self.batch_id = timestamp_slug()
+        self.batch_id = "%s_%s" % (timestamp_slug(), uuid4().hex)
         executed: List[PlannedAction] = []
 
         for item in actions:
@@ -174,6 +175,11 @@ class Executor(object):
         report.actions = executed
         if not self.dry_run:
             report.log_path = self.write_undo_log(executed)
+            if report.log_path is None:
+                raise RuntimeError(
+                    "已完成 %d 项操作，但撤销日志写入失败（%s）。请手动检查文件；无法通过撤销历史还原。"
+                    % (report.ok, self.log_dir)
+                )
         return report
 
     def _do_move(self, item: PlannedAction, report: ExecutionReport) -> None:
@@ -256,7 +262,7 @@ class Executor(object):
     # Undo log
     # ------------------------------------------------------------------ #
     def write_undo_log(self, actions: Sequence[PlannedAction]) -> Optional[Path]:
-        """Persist ``undo_log_<timestamp>.json`` and return its path."""
+        """Persist this batch's undo log and return its path."""
         payload: Dict[str, Any] = {
             "version": 1,
             "batch_id": self.batch_id,

@@ -185,3 +185,40 @@ def test_undo_move_error_keeps_backup_and_reports_failure(tmp_path: Path, monkey
     assert "disk full" in undone.messages[0]
     assert destination.read_text(encoding="utf-8") == "recover me"
     assert not source.exists()
+
+
+def test_quick_batches_keep_separate_undo_logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from file_organizer import executor as executor_module
+
+    monkeypatch.setattr(executor_module, "timestamp_slug", lambda: "20261114_120000")
+    reports = []
+    for name in ("first.txt", "second.txt"):
+        source = tmp_path / name
+        source.write_text(name, encoding="utf-8")
+        reports.append(_executor(tmp_path).execute([
+            PlannedAction(ACTION_MOVE, source, tmp_path / "out" / name)
+        ]))
+
+    assert reports[0].log_path != reports[1].log_path
+    assert len(list((tmp_path / "logs").glob("undo_log_*.json"))) == 2
+    for report in reports:
+        assert UndoManager(tmp_path / "logs").restore(report.log_path).restored == 1
+    assert (tmp_path / "first.txt").read_text(encoding="utf-8") == "first.txt"
+    assert (tmp_path / "second.txt").read_text(encoding="utf-8") == "second.txt"
+
+
+def test_undo_log_write_failure_is_reported_after_move(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from file_organizer import executor as executor_module
+
+    source = tmp_path / "important.txt"
+    source.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(executor_module, "write_json", lambda path, payload: False)
+
+    with pytest.raises(RuntimeError, match="已完成 1 项操作，但撤销日志写入失败"):
+        _executor(tmp_path).execute([
+            PlannedAction(ACTION_MOVE, source, tmp_path / "out" / source.name)
+        ])
+
+    assert not source.exists()
+    assert (tmp_path / "out" / source.name).read_text(encoding="utf-8") == "keep"
+    assert list((tmp_path / "logs").glob("undo_log_*.json")) == []

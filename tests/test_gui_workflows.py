@@ -161,6 +161,8 @@ def test_gui_empty_folder_cleanup_can_be_undone(tmp_path: Path) -> None:
     root = tmp_path / "files"
     empty = root / "empty"
     empty.mkdir(parents=True)
+    (root / ".git" / "cache").mkdir(parents=True)
+    (root / "ignored" / "cache").mkdir(parents=True)
     app = SimpleNamespace(
         config=Config(tmp_path / "config.json"),
         log_dir=tmp_path / "logs",
@@ -169,7 +171,7 @@ def test_gui_empty_folder_cleanup_can_be_undone(tmp_path: Path) -> None:
         clean_dry_var=Value(False),
     )
     app.get_root = lambda: root
-    app.extra_excludes = lambda: set()
+    app.extra_excludes = lambda: {"ignored"}
     app.trash_dir_for = lambda folder: folder / ".file_organizer_trash"
     app.new_executor = lambda folder, dry_run=False: App.new_executor(app, folder, dry_run)
     app.run_task = lambda work, done, status: done(work())
@@ -449,7 +451,7 @@ def test_gui_undo_history_only_lists_current_folder(tmp_path: Path) -> None:
             config=config,
         ).execute([PlannedAction(ACTION_MOVE, source, root / "Documents" / "note.txt")])
         assert report.log_path is not None
-        report.log_path.rename(log_dir / ("undo_log_%s.json" % root.name))
+    assert len(list(log_dir.glob("undo_log_*.json"))) == 2
 
     app = SimpleNamespace(
         config=config,
