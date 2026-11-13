@@ -1,6 +1,7 @@
 """Headless checks for GUI handlers and their real file-operation pipeline."""
 from __future__ import annotations
 
+import queue
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from file_organizer.config import DEFAULT_EXTENSION_MAP, Config
 from file_organizer.executor import Executor
 from file_organizer.gui import App, messagebox, simpledialog
 from file_organizer.models import ACTION_MOVE, PlannedAction
+from file_organizer.storage import CacheStore
 from file_organizer.undo import UndoManager
 
 
@@ -210,6 +212,7 @@ def test_gui_duplicate_cleanup_keeps_one_copy_and_can_undo(tmp_path: Path) -> No
     app.run_task = lambda work, done, status: done(work())
     app._dup_refresh_group = lambda index: App._dup_refresh_group(app, index)
     app._dup_update_summary = lambda: App._dup_update_summary(app)
+    app._dup_parse = lambda iid: App._dup_parse(app, iid)
     app._dup_done = lambda outcome: App._dup_done(app, outcome)
     app._outcome_rows = App._outcome_rows
     app.new_executor = lambda folder, dry_run=False: App.new_executor(app, folder, dry_run)
@@ -219,6 +222,13 @@ def test_gui_duplicate_cleanup_keeps_one_copy_and_can_undo(tmp_path: Path) -> No
     App.do_dup_find(app)
     assert len(app.dup_groups) == 1
     assert len(app.dup_groups[0].files) == 2
+    app.dup_tree.selection_set("g0_1")
+    App._dup_keep_selected(app)
+    assert app.dup_keep[0] == 1
+    App._dup_skip_selected(app)
+    assert app.dup_keep[0] is None
+    App._dup_reset(app)
+    assert app.dup_keep[0] == 0
     App.do_dup_execute(app)
     assert first.exists() != second.exists()
     assert UndoManager(app.log_dir).restore().restored == 1
@@ -340,3 +350,143 @@ def test_gui_file_browser_lists_selected_folder(tmp_path: Path) -> None:
     assert app.browser_paths == [root / "note.txt"]
     assert app.browser_tree.rows["0"] == ("note.txt", "文件", "5 B")
     assert "1 项" in app.browser_location.get()
+
+
+def test_gui_browser_navigates_and_previews_without_moving_files(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "files"
+    folder = root / "docs"
+    folder.mkdir(parents=True)
+    file = folder / "note.txt"
+    file.write_text("hello", encoding="utf-8")
+    app = SimpleNamespace(
+        browser_root=None,
+        browser_dir=None,
+        browser_tree=Tree(),
+        browser_location=Value(""),
+    )
+    shown = Value("")
+    app.get_root = lambda: root
+    app.run_task = lambda work, done, status: done(work())
+    app._browser_show_text = shown.set
+    app._browser_selected = lambda: App._browser_selected(app)
+    app.browse_refresh = lambda: App.browse_refresh(app)
+    opened = []
+    monkeypatch.setattr("file_organizer.gui.open_in_os", lambda path: opened.append(path))
+
+    App.browse_root(app)
+    assert app.browser_paths == [folder]
+    app.browser_tree.selection_set("0")
+    App.browse_preview(app)
+    assert "文件夹" in shown.get()
+    App.browse_enter(app)
+    assert app.browser_dir == folder
+    app.browser_tree.selection_set("0")
+    App.browse_preview(app)
+    assert "hello" in shown.get()
+    App.browse_open(app)
+    assert opened == [file]
+    App.browse_up(app)
+    assert app.browser_dir == root
+    assert file.read_text(encoding="utf-8") == "hello"
+
+
+def test_gui_task_queue_delivers_results_and_errors(monkeypatch) -> None:
+    from file_organizer import gui
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(gui.threading, "Thread", ImmediateThread)
+    errors = []
+    monkeypatch.setattr(messagebox, "showerror", lambda *args, **kwargs: errors.append(args))
+    app = SimpleNamespace(
+        busy=False,
+        events=queue.Queue(),
+        status_var=Value(""),
+        progress=SimpleNamespace(start=lambda delay: None, stop=lambda: None),
+    )
+    logs = []
+    results = []
+    app.log = logs.append
+    app._append_log = logs.append
+    app._finish_task = lambda done, result, error: App._finish_task(app, done, result, error)
+    app._poll_events = lambda: App._poll_events(app)
+    app.after = lambda delay, callback: None
+
+    assert App.run_task(app, lambda: 42, results.append, "计算中")
+    assert app.busy
+    App._poll_events(app)
+    assert results == [42]
+    assert not app.busy and app.status_var.get() == "完成"
+
+    def fail():
+        raise ValueError("broken")
+
+    assert App.run_task(app, fail, results.append, "再次计算")
+    App._poll_events(app)
+    assert app.status_var.get() == "失败"
+    assert len(results) == 1
+    assert errors and "broken" in errors[0][1]
+
+
+def test_gui_undo_history_only_lists_current_folder(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    config = Config(tmp_path / "config.json")
+    log_dir = tmp_path / "logs"
+    for root in (first, second):
+        source = root / "note.txt"
+        source.write_text("x", encoding="utf-8")
+        report = Executor(
+            trash_dir=root / config.trash_dir_name,
+            log_dir=log_dir,
+            config=config,
+        ).execute([PlannedAction(ACTION_MOVE, source, root / "Documents" / "note.txt")])
+        assert report.log_path is not None
+        report.log_path.rename(log_dir / ("undo_log_%s.json" % root.name))
+
+    app = SimpleNamespace(
+        config=config,
+        log_dir=log_dir,
+        undo_tree=Tree(),
+        undo_detail=Tree(),
+        undo_logs=[],
+    )
+    app.get_root = lambda silent=False: first
+    app._undo_manager = lambda: UndoManager(log_dir)
+    app._clear_undo_view = lambda: App._clear_undo_view(app)
+
+    App.refresh_undo_logs(app)
+    assert len(app.undo_logs) == 1
+    assert app.undo_tree.selection() == ("0",)
+    App._undo_show_detail(app)
+    assert len(app.undo_detail.rows) == 1
+    assert app.undo_detail.rows["0"][2] == str(first / "note.txt")
+
+
+def test_gui_cache_clear_needs_confirmation(tmp_path: Path, monkeypatch) -> None:
+    work_dir = tmp_path / "work"
+    with CacheStore(work_dir / "ai_cache.db") as store:
+        store.set("a", "Images")
+    app = SimpleNamespace(work_dir=work_dir, cache_var=Value(""))
+    messages = []
+    app.log = messages.append
+    app.refresh_cache_stats = lambda: App.refresh_cache_stats(app)
+    App.refresh_cache_stats(app)
+    assert "条目：1" in app.cache_var.get()
+
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: False)
+    App.clear_cache(app)
+    with CacheStore(work_dir / "ai_cache.db") as store:
+        assert store.get("a") == "Images"
+
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: True)
+    App.clear_cache(app)
+    assert "条目：0" in app.cache_var.get()
+    assert "已清除 1 条" in messages[0]

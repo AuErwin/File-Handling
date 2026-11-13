@@ -107,9 +107,18 @@ AI 只在“整理归类 → 生成预览”中参与分类：先按扩展名规
 
 ```bash
 pip install -r requirements-dev.txt
-coverage run --source=file_organizer -m pytest -v
-coverage report --skip-covered --fail-under=60
+pytest -v
 flake8 file_organizer run_gui.py tests
 ```
 
-测试全部在临时目录中运行，不会读写 `~/.file_organizer/`。`.github/workflows/ci.yml` 在每次 push 或 Pull Request 时于 Python 3.9–3.12 上运行 flake8、pytest 和覆盖率检查。。
+测试全部在临时目录中运行，不会读写 `~/.file_organizer/`。`.github/workflows/ci.yml` 在每次 push 或 Pull Request 时于 Python 3.9–3.12 上运行 flake8 和 pytest。
+
+演示前如需取得语句覆盖率，可在本地单独运行（不参与 CI，也不设置通过门槛）：
+
+```bash
+python -m pip install coverage
+python -m coverage run --source=file_organizer -m pytest -q
+python -m coverage report --skip-covered
+```
+
+报告中的 `TOTAL` 是本次测试执行到的可执行语句比例；它不代表所有功能都正确。

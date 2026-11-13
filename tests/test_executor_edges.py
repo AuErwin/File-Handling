@@ -8,7 +8,7 @@ import pytest
 
 from file_organizer.config import Config
 from file_organizer.executor import Executor
-from file_organizer.models import ACTION_MOVE, ACTION_RMDIR, PlannedAction
+from file_organizer.models import ACTION_DELETE, ACTION_MOVE, ACTION_RMDIR, PlannedAction
 from file_organizer.undo import UndoManager
 
 
@@ -124,3 +124,64 @@ def test_undo_skips_failed_and_missing_backup_actions(tmp_path: Path) -> None:
     report = manager.restore()
     assert report.skipped == 2 and report.failed == 0
     assert any("backup copy not found" in message for message in report.messages)
+
+
+def test_dry_run_delete_and_remove_dir_leave_disk_unchanged(tmp_path: Path) -> None:
+    source = tmp_path / "a.txt"
+    source.write_text("keep", encoding="utf-8")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    executor = Executor(
+        trash_dir=tmp_path / "trash",
+        log_dir=tmp_path / "logs",
+        config=Config(tmp_path / "config.json"),
+        dry_run=True,
+    )
+
+    report = executor.execute([
+        PlannedAction(ACTION_DELETE, source),
+        PlannedAction(ACTION_RMDIR, empty),
+    ])
+
+    assert report.ok == 2 and report.failed == 0
+    assert report.log_path is None
+    assert source.read_text(encoding="utf-8") == "keep"
+    assert empty.is_dir()
+    assert not (tmp_path / "trash").exists()
+
+
+def test_long_source_path_is_trashed_and_restored(tmp_path: Path) -> None:
+    directory = tmp_path / ("a" * 60) / ("b" * 60) / ("c" * 60)
+    directory.mkdir(parents=True)
+    source = directory / "report.txt"
+    source.write_text("recover me", encoding="utf-8")
+
+    report = _executor(tmp_path).execute([PlannedAction(ACTION_DELETE, source)])
+
+    assert report.ok == 1
+    trashed = report.actions[0].destination
+    assert trashed is not None and trashed.exists()
+    assert trashed.name != source.name  # Long paths use the shortened hash name.
+    assert UndoManager(tmp_path / "logs").restore(report.log_path).restored == 1
+    assert source.read_text(encoding="utf-8") == "recover me"
+
+
+def test_undo_move_error_keeps_backup_and_reports_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from file_organizer import undo as undo_module
+
+    source = tmp_path / "a.txt"
+    destination = tmp_path / "out" / "a.txt"
+    source.write_text("recover me", encoding="utf-8")
+    report = _executor(tmp_path).execute([PlannedAction(ACTION_MOVE, source, destination)])
+
+    def fail_move(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(undo_module.shutil, "move", fail_move)
+
+    undone = UndoManager(tmp_path / "logs").restore(report.log_path)
+
+    assert undone.failed == 1 and undone.restored == 0
+    assert "disk full" in undone.messages[0]
+    assert destination.read_text(encoding="utf-8") == "recover me"
+    assert not source.exists()
