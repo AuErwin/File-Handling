@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .ai_providers import PROVIDER_INFO, PROVIDER_OPENAI, resolve_base_url
 from .models import CATEGORY_OTHERS
 from .utils import PathLike, read_json, write_json
 
@@ -95,14 +96,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "extension_map": dict(DEFAULT_EXTENSION_MAP),
     "ai": {
         "enabled": True,
-        "model": "gpt-4o-mini",
-        "base_url": "",
-        "api_key": "",
-        "api_key_env": "OPENAI_API_KEY",
+        # Which of ``ai.providers`` below is currently active. Switching this
+        # does not discard the other providers' settings.
+        "provider": PROVIDER_OPENAI,
         "batch_size": 20,
         "timeout": 30,
         "max_files": 400,
         "temperature": 0.0,
+        # Each provider keeps its own model / endpoint / key, so switching
+        # providers never loses what was typed for the others.
+        "providers": {
+            provider_id: {
+                "model": info["default_model"],
+                "base_url": "",
+                "api_key": "",
+                "api_key_env": info["default_api_key_env"],
+            }
+            for provider_id, info in PROVIDER_INFO.items()
+        },
     },
     "scan": {
         "exclude_names": [
@@ -198,7 +209,7 @@ class Config(object):
 
         ai = self.data.get("ai")
         if not isinstance(ai, dict):
-            ai = dict(DEFAULT_CONFIG["ai"])
+            ai = copy.deepcopy(DEFAULT_CONFIG["ai"])
             self.data["ai"] = ai
         try:
             ai["batch_size"] = max(1, min(20, int(ai.get("batch_size", 20))))
@@ -212,6 +223,44 @@ class Config(object):
             ai["timeout"] = max(1, int(ai.get("timeout", 30)))
         except (TypeError, ValueError):
             ai["timeout"] = 30
+
+        providers = ai.get("providers")
+        if not isinstance(providers, dict):
+            providers = {}
+        normalized_providers: Dict[str, Dict[str, Any]] = {}
+        for provider_id, info in PROVIDER_INFO.items():
+            section = providers.get(provider_id)
+            section = dict(section) if isinstance(section, dict) else {}
+            normalized_providers[provider_id] = {
+                "model": str(section.get("model") or info["default_model"]).strip() or info["default_model"],
+                "base_url": str(section.get("base_url") or "").strip(),
+                "api_key": str(section.get("api_key") or ""),
+                "api_key_env": str(section.get("api_key_env") or info["default_api_key_env"]).strip()
+                or info["default_api_key_env"],
+            }
+        # One-time migration from the old single-provider layout, where
+        # ``ai.model`` / ``ai.base_url`` / ``ai.api_key`` / ``ai.api_key_env``
+        # lived directly under ``ai`` and only OpenAI (or an OpenAI-compatible
+        # endpoint) was supported.
+        legacy_keys = ("model", "base_url", "api_key", "api_key_env")
+        if any(key in ai for key in legacy_keys):
+            legacy = normalized_providers[PROVIDER_OPENAI]
+            if ai.get("model"):
+                legacy["model"] = str(ai["model"]).strip() or legacy["model"]
+            if ai.get("base_url"):
+                legacy["base_url"] = str(ai["base_url"]).strip()
+            if ai.get("api_key"):
+                legacy["api_key"] = str(ai["api_key"])
+            if ai.get("api_key_env"):
+                legacy["api_key_env"] = str(ai["api_key_env"]).strip() or legacy["api_key_env"]
+            for key in legacy_keys:
+                ai.pop(key, None)
+        ai["providers"] = normalized_providers
+
+        provider = str(ai.get("provider") or PROVIDER_OPENAI).strip()
+        if provider not in PROVIDER_INFO:
+            provider = PROVIDER_OPENAI
+        ai["provider"] = provider
 
         scan = self.data.get("scan")
         if not isinstance(scan, dict):
@@ -276,13 +325,61 @@ class Config(object):
         return str(self.get("safety.trash_dir_name", ".file_organizer_trash"))
 
     @property
+    def ai_provider(self) -> str:
+        """Id of the currently selected AI service provider (``openai`` / ``deepseek`` / ``claude``)."""
+        provider = str(self.get("ai.provider", PROVIDER_OPENAI) or PROVIDER_OPENAI)
+        return provider if provider in PROVIDER_INFO else PROVIDER_OPENAI
+
+    def ai_provider_settings(self, provider_id: Optional[str] = None) -> Dict[str, Any]:
+        """Normalized ``model`` / ``base_url`` / ``api_key`` / ``api_key_env`` for one provider.
+
+        ``base_url`` is resolved to the provider's official endpoint when left
+        blank, so callers never have to special-case "empty means default".
+        """
+        target = provider_id if provider_id in PROVIDER_INFO else self.ai_provider
+        info = PROVIDER_INFO[target]
+        section = self.get("ai.providers.%s" % target, {})
+        section = section if isinstance(section, dict) else {}
+        model = str(section.get("model") or info["default_model"]).strip() or info["default_model"]
+        base_url = str(section.get("base_url") or "").strip()
+        api_key = str(section.get("api_key") or "")
+        api_key_env = str(section.get("api_key_env") or info["default_api_key_env"]).strip() \
+            or info["default_api_key_env"]
+        return {
+            "provider": target,
+            "model": model,
+            "base_url": base_url,
+            "resolved_base_url": resolve_base_url(target, base_url),
+            "api_key": api_key,
+            "api_key_env": api_key_env,
+        }
+
+    def set_ai_provider_settings(self, provider_id: str, settings: Dict[str, Any]) -> None:
+        """Write ``model`` / ``base_url`` / ``api_key`` / ``api_key_env`` for one provider."""
+        if provider_id not in PROVIDER_INFO:
+            return
+        for key in ("model", "base_url", "api_key", "api_key_env"):
+            if key in settings:
+                self.set("ai.providers.%s.%s" % (provider_id, key), settings[key])
+
+    @property
     def ai_settings(self) -> Dict[str, Any]:
-        """Snapshot of the ``ai`` section with normalized values."""
+        """Snapshot of the ``ai`` section, flattened for the *active* provider.
+
+        Shared keys (``enabled``, ``batch_size``, ``max_files``, ``timeout``,
+        ``temperature``, ``provider``) come first, then the active provider's
+        ``model`` / ``base_url`` / ``api_key`` / ``api_key_env`` are merged in
+        under those same familiar flat names, so existing callers that only
+        ever dealt with one provider keep working unchanged.
+        """
         section = self.get("ai", {})
         if not isinstance(section, dict):
             section = {}
-        merged: Dict[str, Any] = dict(DEFAULT_CONFIG["ai"])
-        merged.update(section)
+        merged: Dict[str, Any] = {
+            key: value for key, value in dict(DEFAULT_CONFIG["ai"]).items() if key != "providers"
+        }
+        merged.update({k: v for k, v in section.items() if k != "providers"})
+        merged.update(self.ai_provider_settings(merged.get("provider")))
         # Environment overrides the file, which itself overrides the defaults.
         env_model = os.environ.get("FILE_ORGANIZER_AI_MODEL")
         if env_model:

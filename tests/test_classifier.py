@@ -96,7 +96,7 @@ def test_classify_all_unresolved_without_ai_key_falls_back_to_others(
 def test_api_key_prefers_explicit_config_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
     config = _config(tmp_path)
-    config.set("ai.api_key", "config-key")
+    config.set("ai.providers.openai.api_key", "config-key")
 
     classifier = AIClassifier(config=config)
 
@@ -107,7 +107,7 @@ def test_api_key_reads_configured_env_var_name(tmp_path: Path, monkeypatch: pyte
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("MY_PROVIDER_KEY", "provider-key")
     config = _config(tmp_path)
-    config.set("ai.api_key_env", "MY_PROVIDER_KEY")
+    config.set("ai.providers.openai.api_key_env", "MY_PROVIDER_KEY")
 
     classifier = AIClassifier(config=config)
 

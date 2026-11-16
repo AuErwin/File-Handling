@@ -17,6 +17,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import ai_providers
+from .ai_providers import TestResult
 from .config import Config
 from .models import CATEGORY_OTHERS, SOURCE_AI, SOURCE_CACHE, SOURCE_RULE, SOURCE_UNKNOWN, FileInfo
 from .storage import CacheStore
@@ -37,6 +39,7 @@ GENERIC_API_KEY_ENV = "FILE_ORGANIZER_API_KEY"
 #: requiring ``api_key_env`` to be edited in ``config.json``.
 FALLBACK_API_KEY_ENVS = (
     "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
     "AZURE_OPENAI_API_KEY",
     "DEEPSEEK_API_KEY",
     "MOONSHOT_API_KEY",
@@ -90,12 +93,19 @@ class AIClassifier(object):
         self._client: Any = None
         self._client_error: Optional[str] = None
         self._initialized = False
+        self._ready = False
 
     # -- configuration ------------------------------------------------------- #
     @property
     def settings(self) -> Dict[str, Any]:
-        """Normalized ``ai`` section."""
+        """Normalized ``ai`` section, flattened for the active provider."""
         return self.config.ai_settings
+
+    @property
+    def provider(self) -> str:
+        """Id of the active AI service provider (``openai`` / ``deepseek`` / ``claude``)."""
+        value = str(self.settings.get("provider", ai_providers.PROVIDER_OPENAI) or ai_providers.PROVIDER_OPENAI)
+        return value if value in ai_providers.PROVIDER_INFO else ai_providers.PROVIDER_OPENAI
 
     @property
     def api_key(self) -> str:
@@ -165,21 +175,33 @@ class AIClassifier(object):
 
     # -- client -------------------------------------------------------------- #
     def _ensure_client(self) -> bool:
-        """Lazily build the OpenAI client.  Returns ``False`` with a stored reason."""
+        """Lazily build the provider client. Returns ``False`` with a stored reason.
+
+        For ``openai`` / ``deepseek`` this builds (and caches) an OpenAI SDK
+        client. ``claude`` talks to Anthropic's Messages API directly over
+        HTTP per request (see :mod:`file_organizer.ai_providers`), so there is
+        no persistent client object to build -- only the API key needs to be
+        present.
+        """
         if self._initialized:
+            if self.provider == ai_providers.PROVIDER_CLAUDE:
+                return self._ready
             return self._client is not None
         self._initialized = True
-        try:
-            from openai import OpenAI  # type: ignore
-        except Exception as exc:  # ImportError or an incompatible old release
-            self._client_error = "openai is not installed (%s)" % exc
-            return False
         key = self.api_key
         if not key:
             self._client_error = (
                 "no API key found (set %s, or %s, or ai.api_key in config.json)"
                 % (self.settings.get("api_key_env", "OPENAI_API_KEY"), GENERIC_API_KEY_ENV)
             )
+            return False
+        if self.provider == ai_providers.PROVIDER_CLAUDE:
+            self._ready = True
+            return True
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception as exc:  # ImportError or an incompatible old release
+            self._client_error = "openai is not installed (%s)" % exc
             return False
         kwargs: Dict[str, Any] = {
             "api_key": key,
@@ -188,8 +210,11 @@ class AIClassifier(object):
         }
         if self.base_url:
             kwargs["base_url"] = self.base_url
+        elif self.provider == ai_providers.PROVIDER_DEEPSEEK:
+            kwargs["base_url"] = ai_providers.default_base_url(ai_providers.PROVIDER_DEEPSEEK)
         try:
             self._client = OpenAI(**kwargs)
+            self._ready = True
             return True
         except Exception as exc:
             self._client_error = "cannot build OpenAI client (%s)" % exc
@@ -207,19 +232,50 @@ class AIClassifier(object):
         self._ensure_client()
         return self._client_error
 
+    # -- connection test / model discovery ------------------------------------ #
+    def test_connection(self) -> TestResult:
+        """Send the smallest possible request with the current settings.
+
+        Used by the "测试连接" button: never touches the cache, never raises.
+        """
+        return ai_providers.test_connection(
+            self.provider,
+            self.api_key,
+            self.base_url,
+            self.model,
+            timeout=float(self.settings.get("timeout", 30) or 30),
+        )
+
+    def list_models(self) -> List[str]:
+        """Fetch the live model list for the active provider.
+
+        Raises :class:`~file_organizer.ai_providers.ProviderError` on failure
+        (missing key, network error, ...); callers should fall back to the
+        static list in that case rather than treating it as fatal.
+        """
+        return ai_providers.list_models(
+            self.provider,
+            self.api_key,
+            self.base_url,
+            timeout=float(self.settings.get("timeout", 30) or 30),
+        )
+
     # -- request -------------------------------------------------------------- #
-    def _build_messages(self, names: Sequence[str]) -> List[Dict[str, str]]:
-        """Build the chat messages for a batch of file names."""
+    def _user_prompt(self, names: Sequence[str]) -> str:
+        """Build the user-turn text for a batch of file names (provider agnostic)."""
         listing = "\n".join("%d. %s" % (index, name) for index, name in enumerate(names))
         allowed = ", ".join(self.config.categories)
-        user_prompt = (
+        return (
             "Allowed categories: %s\n\n"
             "File names:\n%s\n\n"
             "Reply with the JSON object only." % (allowed, listing)
         )
+
+    def _build_messages(self, names: Sequence[str]) -> List[Dict[str, str]]:
+        """Build the OpenAI-style chat messages for a batch of file names."""
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": self._user_prompt(names)},
         ]
 
     @staticmethod
@@ -257,24 +313,47 @@ class AIClassifier(object):
     def _request_batch(self, names: Sequence[str]) -> Dict[str, str]:
         """Send one batch and return ``{file_name: category}`` (may be partial)."""
         results: Dict[str, str] = {}
-        if self._client is None:
-            return results
-        try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=self._build_messages(names),
-                temperature=float(self.settings.get("temperature", 0.0) or 0.0),
-                max_tokens=max(200, len(names) * 24),
-            )
-            choices = getattr(response, "choices", None) or []
-            content = ""
-            if choices:
-                message = getattr(choices[0], "message", None)
-                content = getattr(message, "content", "") or ""
+        max_tokens = max(200, len(names) * 24)
+        temperature = float(self.settings.get("temperature", 0.0) or 0.0)
+
+        if self.provider == ai_providers.PROVIDER_CLAUDE:
+            if not self.api_key:
+                return results
+            try:
+                content = ai_providers.chat_once(
+                    ai_providers.PROVIDER_CLAUDE,
+                    self.api_key,
+                    self.base_url,
+                    self.model,
+                    system_prompt=_SYSTEM_PROMPT,
+                    user_prompt=self._user_prompt(names),
+                    timeout=float(self.settings.get("timeout", 30) or 30),
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced via last_error (ProviderError included)
+                self._client_error = "API request failed (%s)" % exc
+                return results
             payload = self._extract_json(content)
-        except Exception as exc:
-            self._client_error = "API request failed (%s)" % exc
-            return results
+        else:
+            if self._client is None:
+                return results
+            try:
+                response = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=self._build_messages(names),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                choices = getattr(response, "choices", None) or []
+                content = ""
+                if choices:
+                    message = getattr(choices[0], "message", None)
+                    content = getattr(message, "content", "") or ""
+                payload = self._extract_json(content)
+            except Exception as exc:
+                self._client_error = "API request failed (%s)" % exc
+                return results
 
         if isinstance(payload, list):
             normalized: Dict[Any, Any] = {}

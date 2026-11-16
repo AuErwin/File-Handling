@@ -13,7 +13,7 @@ from file_organizer.storage import CacheStore
 
 def test_ai_response_is_validated_cached_and_reused(tmp_path: Path, monkeypatch) -> None:
     config = Config(tmp_path / "config.json")
-    config.set("ai.api_key", "test-only")
+    config.set("ai.providers.openai.api_key", "test-only")
     config.set("ai.batch_size", 2)
     requests = []
 
@@ -76,6 +76,89 @@ def test_ai_accepts_array_response_and_rejects_bad_indices(tmp_path: Path) -> No
     assert classifier._request_batch(["a.foo", "b.foo"]) == {"b.foo": "Documents"}
     assert classifier._extract_json("prefix {\"0\": \"Images\"} suffix") == {"0": "Images"}
     assert classifier._extract_json("not JSON") is None
+
+
+def test_claude_provider_is_dispatched_through_ai_providers(tmp_path: Path, monkeypatch) -> None:
+    """Switching ``ai.provider`` to ``claude`` must route requests through the
+    Anthropic (non OpenAI-compatible) code path instead of the ``openai`` SDK."""
+    config = Config(tmp_path / "config.json")
+    config.set("ai.provider", "claude")
+    config.set("ai.providers.claude.api_key", "claude-key")
+    config.set("ai.providers.claude.model", "claude-3-5-haiku-20241022")
+
+    calls = []
+
+    def fake_chat_once(provider_id, api_key, base_url, model, **kwargs):
+        calls.append((provider_id, api_key, model, kwargs.get("system_prompt"), kwargs.get("user_prompt")))
+        return '{"0": "Images"}'
+
+    import file_organizer.classifier as classifier_module
+
+    monkeypatch.setattr(classifier_module.ai_providers, "chat_once", fake_chat_once)
+    classifier = AIClassifier(config, CacheStore(None))
+
+    resolved, sources = classifier.classify_names(["mystery.foo"])
+
+    assert resolved == {"mystery.foo": "Images"}
+    assert sources == {"mystery.foo": SOURCE_AI}
+    assert len(calls) == 1
+    provider_id, api_key, model, system_prompt, user_prompt = calls[0]
+    assert provider_id == "claude"
+    assert api_key == "claude-key"
+    assert model == "claude-3-5-haiku-20241022"
+    assert system_prompt  # Claude gets the instructions via the dedicated system field.
+    assert "mystery.foo" in user_prompt
+
+
+def test_claude_provider_request_failure_is_surfaced_as_last_error(tmp_path: Path, monkeypatch) -> None:
+    config = Config(tmp_path / "config.json")
+    config.set("ai.provider", "claude")
+    config.set("ai.providers.claude.api_key", "claude-key")
+
+    import file_organizer.classifier as classifier_module
+    from file_organizer.ai_providers import ProviderError
+
+    def fake_chat_once(*args, **kwargs):
+        raise ProviderError("API Key 无效或未提供")
+
+    monkeypatch.setattr(classifier_module.ai_providers, "chat_once", fake_chat_once)
+    classifier = AIClassifier(config, CacheStore(None))
+
+    resolved, sources = classifier.classify_names(["mystery.foo"])
+
+    assert resolved == sources == {}
+    assert "API Key 无效" in classifier.last_error
+
+
+def test_test_connection_and_list_models_delegate_to_ai_providers(tmp_path: Path, monkeypatch) -> None:
+    config = Config(tmp_path / "config.json")
+    config.set("ai.provider", "deepseek")
+    config.set("ai.providers.deepseek.api_key", "ds-key")
+
+    import file_organizer.classifier as classifier_module
+    from file_organizer.ai_providers import TestResult
+
+    seen = {}
+
+    def fake_test_connection(provider_id, api_key, base_url, model, timeout):
+        seen["test"] = (provider_id, api_key, model)
+        return TestResult(True, "连接成功", model=model, elapsed_ms=12.0)
+
+    def fake_list_models(provider_id, api_key, base_url, timeout):
+        seen["list"] = (provider_id, api_key)
+        return ["deepseek-chat", "deepseek-reasoner"]
+
+    monkeypatch.setattr(classifier_module.ai_providers, "test_connection", fake_test_connection)
+    monkeypatch.setattr(classifier_module.ai_providers, "list_models", fake_list_models)
+    classifier = AIClassifier(config, CacheStore(None))
+
+    result = classifier.test_connection()
+    models = classifier.list_models()
+
+    assert result.ok is True
+    assert seen["test"] == ("deepseek", "ds-key", "deepseek-chat")
+    assert models == ["deepseek-chat", "deepseek-reasoner"]
+    assert seen["list"] == ("deepseek", "ds-key")
 
 
 def test_overall_classifier_counts_ai_and_cache_sources(tmp_path: Path) -> None:

@@ -79,29 +79,34 @@ GUI 使用 Tkinter。在 Homebrew Python 3.14 下若提示缺少 `_tkinter`，�
 
 AI 只在“整理归类 → 生成预览”中参与分类：先按扩展名规则分类；规则认不出的文件先查本地缓存，缓存没有结果时才发送**文件名**给 AI，不会发送文件内容。未配置有效 API Key 或请求失败时，仍无法识别的文件归入 `Others`。生成预览不移动文件，但可能产生 AI 请求和费用。
 
-默认模型为 `gpt-4o-mini`，默认使用 OpenAI 接口；通过 `base_url` 可以指向任何 **OpenAI 兼容**的服务（DeepSeek、Moonshot/Kimi、通义千问 DashScope、智谱 GLM、SiliconFlow、OpenRouter、Groq、本地部署的 Ollama/vLLM 等）。
+“设置 → AI 分类”可以在 **Claude（Anthropic）/ ChatGPT（OpenAI）/ DeepSeek** 三个服务商之间切换。每个服务商各自保存模型、Base URL、API Key，互不覆盖；切换服务商、保存设置都不会丢失其他服务商已填写的内容。Base URL 留空即使用该服务商的官方地址；也可以填自定义地址（私有部署、代理等）。
 
-程序按下面的顺序查找密钥，**第一个非空的值生效**：
+模型下拉框可以直接编辑手动填写模型 ID，也可以点击“获取模型列表”向服务商的官方接口请求当前可用的模型，成功后自动填充下拉候选；接口不可用或未配置 Key 时会退回到内置的（会持续维护的）常用模型列表，不影响继续手动填写。
 
-1. 设置中填写的 API Key（`config.json` 的 `ai.api_key`，明文保存在本机）；
-2. `ai.api_key_env` 指定名字的环境变量（默认 `OPENAI_API_KEY`）；
+程序按下面的顺序查找当前所选服务商的密钥，**第一个非空的值生效**：
+
+1. 设置中填写的该服务商 API Key（保存在 `config.json` 的 `ai.providers.<provider>.api_key`，明文保存在本机）；
+2. `ai.providers.<provider>.api_key_env` 指定名字的环境变量（默认按服务商分别是 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`）；
 3. 通用环境变量 `FILE_ORGANIZER_API_KEY`，无论用哪家服务都有效；
-4. 常见厂商的环境变量：`OPENAI_API_KEY`、`AZURE_OPENAI_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`、`DASHSCOPE_API_KEY`、`ZHIPUAI_API_KEY`、`SILICONFLOW_API_KEY`、`OPENROUTER_API_KEY`、`GROQ_API_KEY`、`TOGETHER_API_KEY`、`MISTRAL_API_KEY`。
+4. 常见厂商的环境变量：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`AZURE_OPENAI_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`、`DASHSCOPE_API_KEY`、`ZHIPUAI_API_KEY`、`SILICONFLOW_API_KEY`、`OPENROUTER_API_KEY`、`GROQ_API_KEY`、`TOGETHER_API_KEY`、`MISTRAL_API_KEY`。
 
 “设置 → AI 分类”提供以下选项：
 
 | 设置 | 默认值 | 作用 |
 | --- | --- | --- |
 | 启用 AI 补充分类（`enabled`） | 开 | 决定分类页复选框的默认状态；分类页可临时取消或勾选 |
-| 模型（`model`） | `gpt-4o-mini` | 请求使用的模型；环境变量 `FILE_ORGANIZER_AI_MODEL` 优先 |
-| Base URL（`base_url`） | 空 | 留空时使用 OpenAI 默认接口；环境变量 `OPENAI_BASE_URL` 优先 |
-| API Key（`api_key`） | 空 | 接口密钥 |
-| API Key 环境变量名（`api_key_env`） | `OPENAI_API_KEY` | 固定读取某个自定义变量名 |
+| AI 服务商（`provider`） | `openai` | 当前生效的服务商：`claude` / `openai` / `deepseek` |
+| 模型（每个服务商各自的 `model`） | 各服务商官方默认模型 | 请求使用的模型；可手动填写或“获取模型列表”后选择 |
+| Base URL（每个服务商各自的 `base_url`） | 空＝官方地址 | 留空使用官方接口地址，可填自定义地址 |
+| API Key（每个服务商各自的 `api_key`） | 空 | 接口密钥，输入框中以 `•` 遮挡显示 |
+| API Key 环境变量名（每个服务商各自的 `api_key_env`） | 见上 | 固定读取某个自定义变量名 |
 | 每批文件数（`batch_size`） | 20 | 一次请求最多发送多少个文件名，限制为 1–20 |
 | 最多送 AI 的文件数（`max_files`） | 400 | 一次最多请求多少个未缓存的文件名；0 表示不限制 |
 | 超时（`timeout`） | 30 秒 | 单次 API 请求的超时时间 |
 
-“检测 AI 是否可用”只检查本地是否有 `openai` 库和 API Key，**不会发送测试请求**。AI 结果按文件名（含后缀）缓存在 `~/.file_organizer/ai_cache.db`，同名文件可复用，没有 API Key 时也能读取已保存的结果。“设置”页的“AI 分类缓存”可查看和清空缓存。
+点击“测试连接”会用当前填写的 Key / Base URL / 模型，向该服务商发送一次最小请求（几个 token），用来验证配置是否可用：成功会显示服务商、实际测试的模型和耗时；失败会给出易懂的原因（API Key 无效、没有模型权限、余额不足、请求超时、地址不正确等）。测试期间按钮会置灰并显示“正在测试…”，避免重复点击；测试本身会消耗少量 API 额度，按钮旁边有提示。
+
+AI 结果按文件名（含后缀）缓存在 `~/.file_organizer/ai_cache.db`，同名文件可复用，没有 API Key 时也能读取已保存的结果。“设置”页的“AI 分类缓存”可查看和清空缓存。
 
 ## 测试
 

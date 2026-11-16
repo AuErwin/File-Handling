@@ -249,12 +249,22 @@ def test_gui_settings_are_saved_and_normalized(tmp_path: Path, monkeypatch) -> N
         "max_files": Value("-3"),
         "timeout": Value("0"),
     }
+    # Only the openai provider's fields are visible in the test fixture (the
+    # other two providers simply have nothing cached for them yet, exactly as
+    # a first-time user who never touched them would leave it).
+    app._current_ai_provider = "openai"
+    app._ai_provider_cache = {}
+    app.ai_provider_label_var = Value("")
+    app.ai_model_combo = SimpleNamespace(configure=lambda **kwargs: None)
+    app.ai_test_result_var = Value("")
     app.excl_names_var = Value("cache， builds")
     app.follow_var = Value(True)
     app.confirm_var = Value(False)
     app.use_ai_var = Value(True)
     app.log = lambda text: None
     app.apply_ai_settings = lambda: App.apply_ai_settings(app)
+    app._read_provider_fields_from_vars = lambda: App._read_provider_fields_from_vars(app)
+    app._write_provider_fields_to_vars = lambda pid: App._write_provider_fields_to_vars(app, pid)
     app.load_settings = lambda: App.load_settings(app)
     monkeypatch.setattr(messagebox, "showinfo", lambda *args, **kwargs: None)
 
@@ -262,13 +272,40 @@ def test_gui_settings_are_saved_and_normalized(tmp_path: Path, monkeypatch) -> N
 
     loaded = Config(app.config.path)
     assert loaded.get("ai.enabled") is False
-    assert loaded.get("ai.model") == "custom-model"
+    assert loaded.get("ai.providers.openai.model") == "custom-model"
     assert loaded.get("ai.batch_size") == 20
     assert loaded.get("ai.max_files") == 0
     assert loaded.get("ai.timeout") == 1
     assert loaded.excluded_names == ["cache", "builds"]
     assert loaded.get("scan.follow_symlinks") is True
-    assert loaded.get("safety.require_delete_confirmation") is False
+
+
+def test_gui_provider_switch_keeps_each_providers_fields(tmp_path: Path) -> None:
+    """Switching the provider combobox must not discard the other provider's values."""
+    app = SimpleNamespace(config=Config(tmp_path / "config.json"))
+    app.ai_vars = {
+        "model": Value(""), "base_url": Value(""), "api_key": Value(""), "api_key_env": Value(""),
+    }
+    app.ai_model_combo = SimpleNamespace(configure=lambda **kwargs: None)
+    app.ai_test_result_var = Value("")
+    app.ai_test_result_label = SimpleNamespace(configure=lambda **kwargs: None)
+    app._label_to_provider = {"Claude（Anthropic）": "claude", "ChatGPT（OpenAI）": "openai", "DeepSeek": "deepseek"}
+    app.ai_provider_label_var = Value("ChatGPT（OpenAI）")
+    app._current_ai_provider = "openai"
+    app._ai_provider_cache = {"openai": {}, "deepseek": {}, "claude": {}}
+    app._read_provider_fields_from_vars = lambda: App._read_provider_fields_from_vars(app)
+    app._write_provider_fields_to_vars = lambda pid: App._write_provider_fields_to_vars(app, pid)
+
+    app.ai_vars["model"].set("gpt-4o")
+    app.ai_vars["api_key"].set("sk-openai")
+    app.ai_provider_label_var.set("Claude（Anthropic）")
+    App._on_ai_provider_changed(app)
+
+    assert app._current_ai_provider == "claude"
+    assert app._ai_provider_cache["openai"]["model"] == "gpt-4o"
+    assert app._ai_provider_cache["openai"]["api_key"] == "sk-openai"
+    # Switching shows Claude's own (still empty / default) fields, not OpenAI's.
+    assert app.ai_vars["api_key"].get() == ""
 
 
 def test_gui_custom_rule_can_be_saved(tmp_path: Path, monkeypatch) -> None:

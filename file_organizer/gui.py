@@ -24,6 +24,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from file_organizer import ai_providers
+from file_organizer.ai_providers import PROVIDER_INFO, PROVIDER_ORDER, ProviderError
 from file_organizer.classifier import AIClassifier, Classifier
 from file_organizer.cleaner import Cleaner
 from file_organizer.config import DEFAULT_EXTENSION_MAP, Config
@@ -223,6 +225,8 @@ class App(tk.Tk):
         style.configure("Title.TLabel", font=(tkfont.nametofont("TkDefaultFont").actual("family"), 12, "bold"))
         style.configure("Hint.TLabel", foreground="#666666")
         style.configure("Danger.TButton", foreground="#b00020")
+        style.configure("Success.TLabel", foreground="#1b7f3a")
+        style.configure("Danger.TLabel", foreground="#b00020")
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self)
@@ -1324,8 +1328,10 @@ class App(tk.Tk):
     # 页签 8：设置（AI / 安全 / 缓存）
     # ------------------------------------------------------------------ #
     def _build_settings_tab(self, tab: ttk.Frame) -> None:
-        ai = ttk.LabelFrame(tab, text="AI 分类（OpenAI 兼容接口，只发送文件名）", padding=10)
+        ai = ttk.LabelFrame(tab, text="AI 分类（只发送文件名，不发送文件内容）", padding=10)
         ai.pack(fill="x")
+
+        # -- 共享设置（启用开关 + 批量 / 超时参数，三个服务商通用） -------- #
         self.ai_vars: Dict[str, tk.Variable] = {
             "enabled": tk.BooleanVar(),
             "model": tk.StringVar(),
@@ -1337,22 +1343,65 @@ class App(tk.Tk):
             "timeout": tk.StringVar(),
         }
         ttk.Checkbutton(ai, text="启用 AI 补充分类", variable=self.ai_vars["enabled"]).grid(
-            row=0, column=0, columnspan=2, sticky="w"
+            row=0, column=0, columnspan=3, sticky="w"
         )
+
+        # -- 服务商选择：切换后下面的模型 / 连接信息整体跟着切换 --------- #
+        ttk.Label(ai, text="AI 服务商：").grid(row=1, column=0, sticky="w", pady=2)
+        self._provider_labels = [PROVIDER_INFO[pid]["label"] for pid in PROVIDER_ORDER]
+        self._label_to_provider = {PROVIDER_INFO[pid]["label"]: pid for pid in PROVIDER_ORDER}
+        self.ai_provider_label_var = tk.StringVar()
+        provider_combo = ttk.Combobox(
+            ai, textvariable=self.ai_provider_label_var, values=self._provider_labels,
+            state="readonly", width=20,
+        )
+        provider_combo.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        provider_combo.bind("<<ComboboxSelected>>", self._on_ai_provider_changed)
+        self._current_ai_provider = PROVIDER_ORDER[0]
+        # 每个服务商各自的 model / base_url / api_key / api_key_env，内存中保留，
+        # 切换服务商时不会互相覆盖（保存时一并写入配置文件）。
+        self._ai_provider_cache: Dict[str, Dict[str, str]] = {}
+
+        # -- 模型：下拉可编辑（允许手填模型 ID），旁边一个“获取模型列表” --- #
+        ttk.Label(ai, text="模型：").grid(row=2, column=0, sticky="w", pady=2)
+        self.ai_model_combo = ttk.Combobox(ai, textvariable=self.ai_vars["model"], width=34)
+        self.ai_model_combo.grid(row=2, column=1, sticky="ew", padx=6, pady=2)
+        self.ai_fetch_models_btn = ttk.Button(ai, text="获取模型列表", command=self.fetch_ai_models)
+        self.ai_fetch_models_btn.grid(row=2, column=2, sticky="w")
+
         fields = [
-            ("model", "模型"), ("base_url", "Base URL（可留空）"), ("api_key", "API Key"),
+            ("base_url", "Base URL（留空＝官方地址）"), ("api_key", "API Key"),
             ("api_key_env", "API Key 环境变量名"), ("batch_size", "每批文件数（≤20）"),
             ("max_files", "最多送 AI 的文件数"), ("timeout", "超时（秒）"),
         ]
-        for row, (key, label) in enumerate(fields, start=1):
+        for row, (key, label) in enumerate(fields, start=3):
             ttk.Label(ai, text=label + "：").grid(row=row, column=0, sticky="w", pady=2)
             entry = ttk.Entry(ai, textvariable=self.ai_vars[key], show="•" if key == "api_key" else "")
-            entry.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
+            entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=2)
         ai.columnconfigure(1, weight=1)
-        ttk.Label(
-            ai, text="安全提示：API Key 写进配置文件是明文保存，推荐只设置环境变量（环境变量优先于这里的值）。",
-            style="Hint.TLabel",
-        ).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        hint_row = 3 + len(fields)
+        hint_text = (
+            "安全提示：API Key 写进配置文件是明文保存，推荐只设置环境变量（环境变量优先于这里的值）。"
+            "切换服务商不会丢失其他服务商已填写的信息，保存设置时一并写入。"
+        )
+        ttk.Label(ai, text=hint_text, style="Hint.TLabel", wraplength=900, justify="left").grid(
+            row=hint_row, column=0, columnspan=3, sticky="w", pady=(4, 0)
+        )
+
+        # -- 测试连接：后台线程执行，避免卡界面 / 重复点击 ----------------- #
+        test_row = ttk.Frame(ai)
+        test_row.grid(row=hint_row + 1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.ai_test_btn = ttk.Button(test_row, text="测试连接", command=self.test_ai_connection)
+        self.ai_test_btn.pack(side="left")
+        ttk.Label(test_row, text="（测试会发送一次最小请求，消耗少量 API 额度）", style="Hint.TLabel").pack(
+            side="left", padx=8
+        )
+        self.ai_test_result_var = tk.StringVar(value="")
+        self.ai_test_result_label = ttk.Label(
+            ai, textvariable=self.ai_test_result_var, justify="left", wraplength=900,
+        )
+        self.ai_test_result_label.grid(row=hint_row + 2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         scan = ttk.LabelFrame(tab, text="扫描与安全", padding=10)
         scan.pack(fill="x", pady=8)
@@ -1370,8 +1419,7 @@ class App(tk.Tk):
         btns = ttk.Frame(tab)
         btns.pack(fill="x")
         ttk.Button(btns, text="保存设置", command=self.save_settings).pack(side="left")
-        ttk.Button(btns, text="检测 AI 是否可用", command=self.check_ai).pack(side="left", padx=8)
-        ttk.Button(btns, text="打开配置文件所在目录", command=lambda: open_in_os(self.work_dir)).pack(side="left")
+        ttk.Button(btns, text="打开配置文件所在目录", command=lambda: open_in_os(self.work_dir)).pack(side="left", padx=8)
 
         cache = ttk.LabelFrame(tab, text="AI 分类缓存", padding=10)
         cache.pack(fill="x", pady=8)
@@ -1381,11 +1429,49 @@ class App(tk.Tk):
         ttk.Button(cache, text="刷新", command=self.refresh_cache_stats).pack(side="right", padx=6)
         self.load_settings()
 
+    # -- 服务商切换 / 读写辅助 ------------------------------------------- #
+    def _read_provider_fields_from_vars(self) -> Dict[str, str]:
+        """当前界面上 model / base_url / api_key / api_key_env 的即时取值。"""
+        return {
+            "model": str(self.ai_vars["model"].get()).strip(),
+            "base_url": str(self.ai_vars["base_url"].get()).strip(),
+            "api_key": str(self.ai_vars["api_key"].get()).strip(),
+            "api_key_env": str(self.ai_vars["api_key_env"].get()).strip(),
+        }
+
+    def _write_provider_fields_to_vars(self, provider_id: str) -> None:
+        """把内存缓存中某个服务商的设置，显示到界面的输入框里（含模型下拉候选）。"""
+        info = PROVIDER_INFO[provider_id]
+        values = self._ai_provider_cache.get(provider_id, {})
+        self.ai_vars["model"].set(str(values.get("model") or info["default_model"]))
+        self.ai_vars["base_url"].set(str(values.get("base_url") or ""))
+        self.ai_vars["api_key"].set(str(values.get("api_key") or ""))
+        self.ai_vars["api_key_env"].set(str(values.get("api_key_env") or info["default_api_key_env"]))
+        self.ai_model_combo.configure(values=ai_providers.fallback_models(provider_id))
+
+    def _on_ai_provider_changed(self, _event: Any = None) -> None:
+        # 先把刚才那个服务商填的内容存进内存缓存，再切到新的服务商。
+        self._ai_provider_cache[self._current_ai_provider] = self._read_provider_fields_from_vars()
+        new_provider = self._label_to_provider.get(self.ai_provider_label_var.get(), PROVIDER_ORDER[0])
+        self._current_ai_provider = new_provider
+        self._write_provider_fields_to_vars(new_provider)
+        self.ai_test_result_var.set("")
+        self.ai_test_result_label.configure(style="TLabel")
+
     def load_settings(self) -> None:
-        ai = self.config.ai_settings
+        ai = self.config.get("ai", {})
+        if not isinstance(ai, dict):
+            ai = {}
         self.ai_vars["enabled"].set(bool(ai.get("enabled", True)))
-        for key in ("model", "base_url", "api_key", "api_key_env", "batch_size", "max_files", "timeout"):
-            self.ai_vars[key].set(str(ai.get(key, "") if ai.get(key) is not None else ""))
+        for key, default in (("batch_size", 20), ("max_files", 400), ("timeout", 30)):
+            self.ai_vars[key].set(str(ai.get(key, default)))
+        self._ai_provider_cache = {
+            provider_id: dict(self.config.ai_provider_settings(provider_id)) for provider_id in PROVIDER_ORDER
+        }
+        self._current_ai_provider = self.config.ai_provider
+        self.ai_provider_label_var.set(PROVIDER_INFO[self._current_ai_provider]["label"])
+        self._write_provider_fields_to_vars(self._current_ai_provider)
+        self.ai_test_result_var.set("")
         self.excl_names_var.set(", ".join(self.config.excluded_names))
         self.follow_var.set(bool(self.config.get("scan.follow_symlinks", False)))
         self.confirm_var.set(bool(self.config.get("safety.require_delete_confirmation", True)))
@@ -1406,24 +1492,93 @@ class App(tk.Tk):
             self.config.load()
             self.load_settings()
             self.use_ai_var.set(bool(self.config.get("ai.enabled", True)))
-            self.log("设置已保存。")
+            self.log("设置已保存。当前 AI 服务商：%s" % PROVIDER_INFO[self.config.ai_provider]["label"])
             messagebox.showinfo("已保存", "设置已写入：\n%s" % self.config.path, parent=self)
         else:
             messagebox.showerror("保存失败", "无法写入 %s" % self.config.path, parent=self)
 
-    def check_ai(self) -> None:
-        self.apply_ai_settings()
-        classifier = AIClassifier(self.config, CacheStore(None))
-        if classifier.available:
-            messagebox.showinfo("AI 可用", "已找到 API Key 和 openai 库。\n模型：%s" % classifier.model, parent=self)
-        else:
-            messagebox.showwarning("AI 不可用", "原因：%s" % (classifier.last_error or "未知"), parent=self)
-
     def apply_ai_settings(self) -> None:
-        """把界面上的 AI 设置应用到内存配置（不写文件）。"""
+        """把界面上的 AI 设置（含全部服务商、不止当前显示的这个）应用到内存配置（不写文件）。"""
         self.config.set("ai.enabled", bool(self.ai_vars["enabled"].get()))
-        for key in ("model", "base_url", "api_key", "api_key_env"):
-            self.config.set("ai." + key, str(self.ai_vars[key].get()).strip())
+        self._ai_provider_cache[self._current_ai_provider] = self._read_provider_fields_from_vars()
+        self.config.set("ai.provider", self._current_ai_provider)
+        for provider_id, values in self._ai_provider_cache.items():
+            self.config.set_ai_provider_settings(provider_id, values)
+
+    def _set_ai_controls_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.ai_test_btn.configure(state=state)
+        self.ai_fetch_models_btn.configure(state=state)
+
+    def test_ai_connection(self) -> None:
+        """后台发送一次最小请求，验证 API Key / Base URL / 模型是否可用。"""
+        self.apply_ai_settings()
+        provider_id = self._current_ai_provider
+        provider_label = PROVIDER_INFO[provider_id]["label"]
+        classifier = AIClassifier(self.config, CacheStore(None))
+        self.ai_test_result_var.set("")
+        self.ai_test_result_label.configure(style="TLabel")
+
+        started = self.run_task(
+            classifier.test_connection,
+            lambda result: self._on_ai_test_done(provider_label, result),
+            text="正在测试 %s 连接…" % provider_label,
+        )
+        if started:
+            self._set_ai_controls_busy(True)
+
+    def _on_ai_test_done(self, provider_label: str, result: Any) -> None:
+        self._set_ai_controls_busy(False)
+        if result.ok:
+            self.ai_test_result_label.configure(style="Success.TLabel")
+            self.ai_test_result_var.set(
+                "✅ 连接成功｜服务商：%s｜模型：%s｜耗时：%.0f ms" % (provider_label, result.model, result.elapsed_ms)
+            )
+            self.log("AI 连接测试成功（%s / %s，%.0f ms）。" % (provider_label, result.model, result.elapsed_ms))
+        else:
+            self.ai_test_result_label.configure(style="Danger.TLabel")
+            self.ai_test_result_var.set("❌ 连接失败｜服务商：%s｜原因：%s" % (provider_label, result.message))
+            self.log("AI 连接测试失败（%s）：%s" % (provider_label, result.message))
+
+    def fetch_ai_models(self) -> None:
+        """后台调用服务商的模型列表接口，成功则刷新下拉框候选项。
+
+        接口不支持 / 调用失败时不当作致命错误：保留可维护的静态模型列表，
+        并在日志里说明原因，用户仍可在模型框里手动填写模型 ID。
+        """
+        self.apply_ai_settings()
+        provider_id = self._current_ai_provider
+        provider_label = PROVIDER_INFO[provider_id]["label"]
+        classifier = AIClassifier(self.config, CacheStore(None))
+
+        def work() -> Tuple[List[str], Optional[str]]:
+            try:
+                return classifier.list_models(), None
+            except ProviderError as exc:
+                return [], str(exc)
+            except Exception as exc:  # noqa: BLE001 - never let a bad response kill the UI thread
+                return [], str(exc)
+
+        started = self.run_task(
+            work,
+            lambda outcome: self._on_ai_models_fetched(provider_id, provider_label, outcome),
+            text="正在获取 %s 的模型列表…" % provider_label,
+        )
+        if started:
+            self._set_ai_controls_busy(True)
+
+    def _on_ai_models_fetched(
+        self, provider_id: str, provider_label: str, outcome: Tuple[List[str], Optional[str]]
+    ) -> None:
+        self._set_ai_controls_busy(False)
+        models, error = outcome
+        if error:
+            self.log("获取 %s 模型列表失败（%s），已保留内置列表，可手动填写模型 ID。" % (provider_label, error))
+            return
+        merged = sorted(set(models) | set(ai_providers.fallback_models(provider_id)))
+        if self._current_ai_provider == provider_id:
+            self.ai_model_combo.configure(values=merged)
+        self.log("已获取 %s 模型列表：%d 个。" % (provider_label, len(models)))
 
     def refresh_cache_stats(self) -> None:
         with CacheStore(self.work_dir / "ai_cache.db") as store:
