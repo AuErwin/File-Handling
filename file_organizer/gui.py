@@ -131,12 +131,12 @@ class _TableTree(ttk.Treeview):
         self._font = tkfont.nametofont("TkDefaultFont")
         self._tip: Optional[tk.Toplevel] = None
         self._hover: Tuple[str, str] = ("", "")
-        self._resizing = False
         self.bind("<Motion>", self._show_full_cell, add="+")
+        self.bind("<Motion>", self._block_column_resize, add="+")
         self.bind("<Leave>", self._hide_tip, add="+")
         self.bind("<ButtonPress>", self._hide_tip, add="+")
-        self.bind("<ButtonPress-1>", self._mark_resize, add="+")
-        self.bind("<ButtonRelease-1>", self._refresh_text, add="+")
+        self.bind("<ButtonPress-1>", self._block_column_resize, add="+")
+        self.bind("<Double-1>", self._block_column_resize, add="+")
 
     def _shorten(self, value: str, column: str) -> str:
         width = self.column(column, "width") - 20
@@ -157,7 +157,7 @@ class _TableTree(ttk.Treeview):
         full = {col: str(value) for col, value in zip(columns, values)}
         if "text" in kwargs:
             full["#0"] = str(kwargs["text"])
-            kwargs["text"] = self._shorten(full["#0"], "#0") if "tree" in self["show"] else kwargs["text"]
+            kwargs["text"] = self._shorten(full["#0"], "#0")
         kwargs["values"] = tuple(self._shorten(full[col], col) for col in columns if col in full)
         new_iid = super().insert(parent, index, iid=iid, **kwargs)
         self._full[new_iid] = full
@@ -185,13 +185,13 @@ class _TableTree(ttk.Treeview):
                 self._full.pop(child, None)
         super().delete(*items)
 
-    def _mark_resize(self, event: Any) -> None:
-        self._resizing = self.identify("region", event.x, event.y) == "separator"
+    def _block_column_resize(self, event: Any) -> Optional[str]:
+        if self.identify("region", event.x, event.y) == "separator":
+            self.configure(cursor="arrow")
+            return "break"
+        return None
 
-    def _refresh_text(self, _event: Any = None) -> None:
-        if not self._resizing:
-            return
-        self._resizing = False
+    def refresh_text(self) -> None:
         for iid, values in self._full.items():
             if not self.exists(iid):
                 continue
@@ -227,139 +227,6 @@ class _TableTree(ttk.Treeview):
         ttk.Label(self._tip, text=full, padding=5, wraplength=700).pack()
 
 
-class _PinnedColumnTree(object):
-    """Mirrors a ttk.Treeview's last column onto a second, frozen Treeview.
-
-    ttk.Treeview has no native "frozen column" feature (unlike a web table's
-    CSS ``position: sticky``). This keeps the real, scrollable data in
-    ``main`` and a second, narrow Treeview (``pinned``) showing only the last
-    column, placed outside the horizontally-scrolled area so it always stays
-    flush against the table's right edge. Every write that matters (insert /
-    delete / set / tags / open-close / selection) is mirrored onto ``pinned``
-    under the *same* item id, so the two stay row-for-row aligned.
-
-    The public methods below are exactly the subset of ``ttk.Treeview`` used
-    elsewhere in this module, so existing call sites that already hold a
-    "tree" object keep working unchanged.
-    """
-
-    def __init__(self, main: ttk.Treeview, pinned: ttk.Treeview, pinned_column: str, has_tree_column: bool) -> None:
-        """Wrap ``main`` (scrollable) and ``pinned`` (frozen last column)."""
-        self.main = main
-        self.pinned = pinned
-        self._pinned_column = pinned_column
-        main.bind("<<TreeviewSelect>>", self._on_main_select, add="+")
-        pinned.bind("<<TreeviewSelect>>", self._on_pinned_select, add="+")
-        if has_tree_column:
-            # Only a grouped/hierarchical table (e.g. "重复文件") needs this:
-            # expanding/collapsing a group in ``main`` must show/hide the same
-            # rows in ``pinned``, or the two tables drift out of alignment.
-            main.bind("<<TreeviewOpen>>", self._on_main_open, add="+")
-            main.bind("<<TreeviewClose>>", self._on_main_close, add="+")
-
-    # -- selection kept in sync in both directions -------------------------
-    # ``<<TreeviewSelect>>`` is dispatched through Tk's event queue rather
-    # than fired synchronously inside ``selection_set()``, so a simple
-    # re-entrancy boolean does not stop the two handlers from bouncing the
-    # event back and forth forever. Comparing against the current selection
-    # before writing does: once both sides already agree, neither handler
-    # issues another ``selection_set()``, so the chain terminates by itself.
-    def _on_main_select(self, _event: Any = None) -> None:
-        target = tuple(i for i in self.main.selection() if self.pinned.exists(i))
-        if self.pinned.selection() != target:
-            self.pinned.selection_set(target)
-
-    def _on_pinned_select(self, _event: Any = None) -> None:
-        target = tuple(i for i in self.pinned.selection() if self.main.exists(i))
-        if self.main.selection() != target:
-            self.main.selection_set(target)
-
-    # -- expand / collapse kept in sync (grouped tables only) -------------- #
-    def _on_main_open(self, _event: Any = None) -> None:
-        iid = self.main.focus()
-        if iid and self.pinned.exists(iid):
-            self.pinned.item(iid, open=True)
-
-    def _on_main_close(self, _event: Any = None) -> None:
-        iid = self.main.focus()
-        if iid and self.pinned.exists(iid):
-            self.pinned.item(iid, open=False)
-
-    # -- mutating API, mirrored onto both Treeviews ------------------------ #
-    def insert(
-        self, parent: str = "", index: Any = "end", iid: Optional[str] = None,
-        text: str = "", values: Sequence[Any] = (), open: bool = False, tags: Sequence[str] = (),  # noqa: A002
-    ) -> str:
-        values = tuple(values)
-        main_values = values[:-1]
-        pinned_value = (values[-1],) if values else ("",)
-        new_iid = self.main.insert(parent, index, iid=iid, text=text, values=main_values, open=open, tags=tags)
-        self.pinned.insert(parent, index, iid=new_iid, values=pinned_value, open=open, tags=tags)
-        return new_iid
-
-    def delete(self, *items: str) -> None:
-        main_items = [i for i in items if self.main.exists(i)]
-        pinned_items = [i for i in items if self.pinned.exists(i)]
-        if main_items:
-            self.main.delete(*main_items)
-        if pinned_items:
-            self.pinned.delete(*pinned_items)
-
-    def set(self, iid: str, column: str, value: Any = None) -> Any:
-        target = self.pinned if column == self._pinned_column else self.main
-        return target.set(iid, column, value)
-
-    def item(self, iid: str, **kwargs: Any) -> Any:
-        result = self.main.item(iid, **kwargs)
-        mirrored = {k: v for k, v in kwargs.items() if k in ("tags", "open")}
-        if mirrored and self.pinned.exists(iid):
-            self.pinned.item(iid, **mirrored)
-        return result
-
-    def tag_configure(self, tag: str, **kwargs: Any) -> None:
-        self.main.tag_configure(tag, **kwargs)
-        self.pinned.tag_configure(tag, **kwargs)
-
-    def get_children(self, item: str = "") -> Tuple[str, ...]:
-        return self.main.get_children(item)
-
-    def exists(self, iid: str) -> bool:
-        return self.main.exists(iid)
-
-    def selection(self) -> Tuple[str, ...]:
-        return self.main.selection()
-
-    def selection_set(self, items: Any) -> None:
-        items = (items,) if isinstance(items, str) else tuple(items)
-        self.main.selection_set(items)
-        self.pinned.selection_set(tuple(i for i in items if self.pinned.exists(i)))
-
-    def see(self, iid: str) -> None:
-        self.main.see(iid)
-        if self.pinned.exists(iid):
-            self.pinned.see(iid)
-
-    def bind(self, sequence: str, func: Callable[..., Any], add: Any = None) -> str:
-        return self.main.bind(sequence, func, add)
-
-    def identify(self, *args: Any, **kwargs: Any) -> Any:
-        return self.main.identify(*args, **kwargs)
-
-    def identify_row(self, y: int) -> str:
-        return self.main.identify_row(y)
-
-    def identify_column(self, x: int) -> str:
-        return self.main.identify_column(x)
-
-    def column(self, col_id: str, **kwargs: Any) -> Any:
-        target = self.pinned if col_id == self._pinned_column else self.main
-        return target.column(col_id, **kwargs)
-
-    def heading(self, col_id: str, **kwargs: Any) -> Any:
-        target = self.pinned if col_id == self._pinned_column else self.main
-        return target.heading(col_id, **kwargs)
-
-
 def make_tree(
     parent: tk.Misc,
     columns: Sequence[Tuple[str, str, int, str]],
@@ -368,76 +235,67 @@ def make_tree(
     show: str = "headings",
     tree_heading: str = "",
     tree_width: int = 200,
-    pin_last_column: bool = False,
-) -> Tuple[ttk.Frame, Any]:
-    """创建带滚动条的 Treeview。columns = (id, 标题, 宽度, 对齐)。
+) -> Tuple[ttk.Frame, _TableTree]:
+    """创建列宽随容器调整的 Treeview。columns = (id, 标题, 宽度, 对齐)。
 
-    当列数 >= 2 且 ``pin_last_column`` 为真时，最后一列会被固定在表格
-    容器的右边缘：用第二个窄的 Treeview 单独显示这一列，放在横向滚动条之外，
-    垂直滚动 / 选中状态 / 行颜色标签都会和主表格保持同步，视觉上看起来还是
-    同一张表。只有一列时固定没有意义，会自动退化为普通表格。
+    所有列位于同一张表中；最后一列保持原宽度，其余列填满剩余空间。
     """
     frame = ttk.Frame(parent)
-    pin = pin_last_column and len(columns) >= 2
-    main_columns = columns[:-1] if pin else columns
-
-    main = _TableTree(frame, columns=[c[0] for c in main_columns], show=show, selectmode=selectmode, height=height)
+    # The inner frame lets wide tables shrink to the available window width.
+    container = ttk.Frame(frame, width=200)
+    container.pack_propagate(False)
+    main = _TableTree(container, columns=[c[0] for c in columns], show=show,
+                      selectmode=selectmode, height=height)
     if "tree" in show:
-        main.heading("#0", text=tree_heading.strip(), anchor="w")
-        main.column("#0", width=tree_width, stretch=False)
-    for col_id, title, width, anchor in main_columns:
-        main.heading(col_id, text=title.strip(), anchor=anchor)
-        main.column(col_id, width=width, minwidth=60, anchor=anchor, stretch=False)
+        main.heading("#0", text=tree_heading.strip(), anchor="center")
+        main.column("#0", width=tree_width, minwidth=1, stretch=False)
+    for col_id, title, width, anchor in columns:
+        main.heading(col_id, text=title.strip(), anchor="center")
+        main.column(col_id, width=width, minwidth=1, anchor=anchor, stretch=False)
 
-    vsb = ttk.Scrollbar(frame, orient="vertical")
-    hsb = ttk.Scrollbar(frame, orient="horizontal", command=main.xview)
-    main.configure(xscrollcommand=hsb.set)
-    hsb.grid(row=1, column=0, sticky="ew")
+    vsb = ttk.Scrollbar(frame, orient="vertical", command=main.yview)
+    main.configure(yscrollcommand=vsb.set)
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
+    main.pack(fill="both", expand=True)
+    container.grid(row=0, column=0, sticky="nsew")
+    vsb.place(relx=1.0, rely=0, relheight=1.0, anchor="ne")
+    vsb.lift()
 
-    if not pin:
-        main.configure(yscrollcommand=vsb.set)
-        vsb.configure(command=main.yview)
-        main.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        return frame, main
+    layout = ([("#0", tree_heading, tree_width, "w")] if "tree" in show else []) + list(columns)
+    fixed_width = columns[-1][2] if len(columns) > 1 else 0
+    flexible = layout[:-1] if fixed_width else layout
+    grow_index = next(
+        (i for i, (col, _title, width, anchor) in enumerate(flexible)
+         if col != "#0" and anchor == "w" and width >= 120), 0,
+    )
+    heading_font = tkfont.nametofont("TkHeadingFont")
+    minimums = [max(32, heading_font.measure(title.strip()) + 24)
+                for _col, title, _width, _anchor in flexible]
+    desired = [max(width, minimum) for (_col, _title, width, _anchor), minimum in zip(flexible, minimums)]
+    minimum_total = sum(minimums)
+    desired_total = sum(desired)
 
-    col_id, title, width, anchor = columns[-1]
-    # "headings" even when ``main`` is "tree headings": the pinned panel only
-    # ever shows one flat data column, never the indentation / disclosure
-    # triangle of a grouped table.
-    pinned = _TableTree(frame, columns=[col_id], show="headings", selectmode=selectmode, height=height)
-    pinned.heading(col_id, text=title.strip(), anchor=anchor)
-    pinned.column(col_id, width=width, anchor=anchor, stretch=False)
-    pinned.configure(takefocus=0)
+    def _fit_columns(event: Any) -> None:
+        # The scrollbar covers the Treeview's right border; 2 px is its heading inset.
+        available = max(1, event.width - vsb.winfo_reqwidth() + 2 - fixed_width)
+        if available >= desired_total:
+            widths = desired.copy()
+        elif available >= minimum_total:
+            room = available - minimum_total
+            widths = [minimum + room * (width - minimum) // (desired_total - minimum_total)
+                      for width, minimum in zip(desired, minimums)]
+        else:
+            widths = [max(1, available * minimum // minimum_total) for minimum in minimums]
+        widths[grow_index] += max(0, available - sum(widths))
+        for (col_id, _title, _width, _anchor), width in zip(flexible, widths):
+            main.column(col_id, width=width)
+        if fixed_width:
+            main.column(columns[-1][0], width=fixed_width)
+        main.refresh_text()
 
-    def _sync_vertical(first: str, last: str) -> None:
-        vsb.set(first, last)
-        pinned.yview_moveto(first)
-
-    main.configure(yscrollcommand=_sync_vertical)
-    vsb.configure(command=lambda *args: (main.yview(*args), pinned.yview(*args)))
-
-    def _redirect_wheel_to_main(event: Any) -> str:
-        # Scrolling while the mouse is over the frozen column must still
-        # scroll the table (and, via main's yscrollcommand above, pinned too).
-        if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
-            main.yview_scroll(1, "units")
-        elif getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
-            main.yview_scroll(-1, "units")
-        return "break"
-
-    pinned.bind("<MouseWheel>", _redirect_wheel_to_main)
-    pinned.bind("<Button-4>", _redirect_wheel_to_main)
-    pinned.bind("<Button-5>", _redirect_wheel_to_main)
-
-    main.grid(row=0, column=0, sticky="nsew")
-    pinned.grid(row=0, column=1, sticky="ns")
-    vsb.grid(row=0, column=2, sticky="ns")
-
-    wrapper = _PinnedColumnTree(main, pinned, pinned_column=col_id, has_tree_column=("tree" in show))
-    return frame, wrapper
+    main.bind("<Configure>", _fit_columns, add="+")
+    return frame, main
 
 
 def clear_tree(tree: Any) -> None:
@@ -762,7 +620,7 @@ class App(tk.Tk):
             panes, [("name", "名称", 300, "w"), ("type", "类型", 90, "w"),
                     ("size", "大小", 100, "e")], height=16, selectmode="browse"
         )
-        panes.add(frame, weight=2)
+        panes.add(frame, weight=3)
         self.browser_tree.bind("<<TreeviewSelect>>", self.browse_preview)
         self.browser_tree.bind("<Double-1>", self.browse_enter)
         preview_frame = ttk.Frame(panes)
@@ -771,7 +629,8 @@ class App(tk.Tk):
         self.browser_text.configure(yscrollcommand=scrollbar.set)
         self.browser_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        panes.add(preview_frame, weight=3)
+        panes.add(preview_frame, weight=2)
+        panes.bind("<Configure>", lambda event: panes.sashpos(0, round(event.width * 0.6)))
 
     def _browser_show_text(self, content: str) -> None:
         self.browser_text.configure(state="normal")
@@ -1103,7 +962,6 @@ class App(tk.Tk):
                 ("mtime", "修改时间", 155, "center"),
             ],
             height=14, show="tree headings", tree_heading="分组", tree_width=210,
-            pin_last_column=True,
         )
         frame.pack(fill="both", expand=True)
         self.dup_tree.tag_configure("trash", foreground="#b00020")
@@ -1576,11 +1434,11 @@ class App(tk.Tk):
 
         ttk.Label(
             tab,
-            text="提示：内置的扩展名规则不能被删除，只能改归入的分类；以“*”标记的是你的自定义规则。修改后记得点“保存”。",
+            text="提示：内置的扩展名规则不能被删除，只能改归入的分类；带“*”的是新增或改动的规则。修改后记得点“保存”。",
             style="Hint.TLabel",
         ).pack(fill="x")
         frame, self.rules_tree = make_tree(
-            tab, [("ext", "扩展名", 140, "w"), ("cat", "分类", 180, "w"), ("note", "", 80, "center")],
+            tab, [("ext", "扩展名", 140, "w"), ("cat", "分类", 180, "w")],
             height=14, selectmode="browse",
         )
         frame.pack(fill="both", expand=True, pady=(6, 0))
@@ -1598,7 +1456,7 @@ class App(tk.Tk):
         clear_tree(self.rules_tree)
         for ext in sorted(self._rules_map):
             custom = DEFAULT_EXTENSION_MAP.get(ext) != self._rules_map[ext]
-            self.rules_tree.insert("", "end", iid=ext, values=(ext, self._rules_map[ext], "*" if custom else ""))
+            self.rules_tree.insert("", "end", iid=ext, values=(ext + (" *" if custom else ""), self._rules_map[ext]))
 
     def _rule_pick(self, _event: Any) -> None:
         sel = self.rules_tree.selection()
