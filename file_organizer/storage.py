@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .utils import PathLike
 
@@ -39,7 +39,7 @@ class CacheStore(object):
         """Open (or create) the SQLite database at ``db_path``."""
         self.db_path: Optional[Path] = Path(str(db_path)) if db_path else None
         self._lock = threading.RLock()
-        self._fallback: Dict[str, Tuple[str, str]] = {}
+        self._fallback: Dict[str, Tuple[str, str, str, float]] = {}
         self._connection: Optional[sqlite3.Connection] = None
         self._enabled = False
         if self.db_path is not None:
@@ -120,7 +120,7 @@ class CacheStore(object):
             return
         stamp = time.time()
         with self._lock:
-            self._fallback[key] = (category, source)
+            self._fallback[key] = (category, source, str(file_name)[:255], stamp)
             if not self.enabled:
                 return
             try:
@@ -147,7 +147,7 @@ class CacheStore(object):
             if not self.enabled:
                 stats["entries"] = len(self._fallback)
                 buckets: Dict[str, int] = {}
-                for category, _source in self._fallback.values():
+                for category, _source, _name, _stamp in self._fallback.values():
                     buckets[category] = buckets.get(category, 0) + 1
                 stats["by_category"] = buckets
                 return stats
@@ -162,6 +162,25 @@ class CacheStore(object):
             except sqlite3.Error:
                 stats["entries"] = len(self._fallback)
         return stats
+
+    def list_entries(self) -> List[Tuple[str, str, str, float]]:
+        """Return this store's file name, category, source and saved time."""
+        with self._lock:
+            if self.enabled:
+                try:
+                    rows = self._connection.execute(
+                        "SELECT file_name, category, source, created_at "
+                        "FROM ai_cache ORDER BY created_at DESC, file_name;"
+                    ).fetchall()
+                    return [(str(name), str(category), str(source), float(stamp))
+                            for name, category, source, stamp in rows]
+                except sqlite3.Error:
+                    self._enabled = False
+            return sorted(
+                ((name, category, source, stamp)
+                 for category, source, name, stamp in self._fallback.values()),
+                key=lambda row: (-row[3], row[0]),
+            )
 
     def clear(self) -> int:
         """Drop every cached entry and return how many rows were removed."""

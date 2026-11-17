@@ -17,6 +17,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 import tkinter.font as tkfont
@@ -43,7 +44,7 @@ from file_organizer.models import (
 from file_organizer.scanner import Scanner
 from file_organizer.storage import CacheStore
 from file_organizer.undo import UndoManager
-from file_organizer.utils import human_readable_size
+from file_organizer.utils import chunked_hash, human_readable_size
 
 APP_TITLE = "智能文件整理器"
 CHECK_ON = "☑"
@@ -121,6 +122,244 @@ def open_in_os(path: Path, select: bool = False) -> None:
         messagebox.showerror("无法打开", "%s" % exc)
 
 
+class _TableTree(ttk.Treeview):
+    """Keep full cell text while showing an ellipsis in narrow columns."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._full: Dict[str, Dict[str, str]] = {}
+        self._font = tkfont.nametofont("TkDefaultFont")
+        self._tip: Optional[tk.Toplevel] = None
+        self._hover: Tuple[str, str] = ("", "")
+        self._resizing = False
+        self.bind("<Motion>", self._show_full_cell, add="+")
+        self.bind("<Leave>", self._hide_tip, add="+")
+        self.bind("<ButtonPress>", self._hide_tip, add="+")
+        self.bind("<ButtonPress-1>", self._mark_resize, add="+")
+        self.bind("<ButtonRelease-1>", self._refresh_text, add="+")
+
+    def _shorten(self, value: str, column: str) -> str:
+        width = self.column(column, "width") - 20
+        if self._font.measure(value) <= width:
+            return value
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._font.measure(value[:mid] + "…") <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return value[:lo] + "…"
+
+    def insert(self, parent: str, index: Any, iid: Optional[str] = None, **kwargs: Any) -> str:
+        values = kwargs.get("values", ())
+        columns = self["columns"]
+        full = {col: str(value) for col, value in zip(columns, values)}
+        if "text" in kwargs:
+            full["#0"] = str(kwargs["text"])
+            kwargs["text"] = self._shorten(full["#0"], "#0") if "tree" in self["show"] else kwargs["text"]
+        kwargs["values"] = tuple(self._shorten(full[col], col) for col in columns if col in full)
+        new_iid = super().insert(parent, index, iid=iid, **kwargs)
+        self._full[new_iid] = full
+        return new_iid
+
+    def set(self, item: str, column: str, value: Any = None) -> Any:
+        if value is None:
+            stored = self._full.get(item, {}).get(column)
+            return stored if stored is not None else super().set(item, column)
+        full = str(value)
+        self._full.setdefault(item, {})[column] = full
+        return super().set(item, column, self._shorten(full, column))
+
+    def item(self, item: str, **kwargs: Any) -> Any:
+        if "text" in kwargs:
+            full = str(kwargs["text"])
+            self._full.setdefault(item, {})["#0"] = full
+            kwargs["text"] = self._shorten(full, "#0")
+        return super().item(item, **kwargs)
+
+    def delete(self, *items: str) -> None:
+        for item in items:
+            self._full.pop(item, None)
+            for child in self.get_children(item):
+                self._full.pop(child, None)
+        super().delete(*items)
+
+    def _mark_resize(self, event: Any) -> None:
+        self._resizing = self.identify("region", event.x, event.y) == "separator"
+
+    def _refresh_text(self, _event: Any = None) -> None:
+        if not self._resizing:
+            return
+        self._resizing = False
+        for iid, values in self._full.items():
+            if not self.exists(iid):
+                continue
+            if "#0" in values:
+                ttk.Treeview.item(self, iid, text=self._shorten(values["#0"], "#0"))
+            for col, value in values.items():
+                if col != "#0":
+                    ttk.Treeview.set(self, iid, col, self._shorten(value, col))
+
+    def _hide_tip(self, _event: Any = None) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+        self._hover = ("", "")
+
+    def _show_full_cell(self, event: Any) -> None:
+        iid = self.identify_row(event.y)
+        column = self.identify_column(event.x)
+        columns = self["columns"]
+        index = int(column[1:]) - 1 if column and column != "#0" else -1
+        col_id = "#0" if column == "#0" else columns[index] if 0 <= index < len(columns) else ""
+        target = (iid, col_id)
+        if target == self._hover:
+            return
+        self._hide_tip()
+        self._hover = target
+        full = self._full.get(iid, {}).get(col_id, "")
+        if not full or self._shorten(full, col_id) == full:
+            return
+        self._tip = tk.Toplevel(self)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry("+%d+%d" % (event.x_root + 12, event.y_root + 14))
+        ttk.Label(self._tip, text=full, padding=5, wraplength=700).pack()
+
+
+class _PinnedColumnTree(object):
+    """Mirrors a ttk.Treeview's last column onto a second, frozen Treeview.
+
+    ttk.Treeview has no native "frozen column" feature (unlike a web table's
+    CSS ``position: sticky``). This keeps the real, scrollable data in
+    ``main`` and a second, narrow Treeview (``pinned``) showing only the last
+    column, placed outside the horizontally-scrolled area so it always stays
+    flush against the table's right edge. Every write that matters (insert /
+    delete / set / tags / open-close / selection) is mirrored onto ``pinned``
+    under the *same* item id, so the two stay row-for-row aligned.
+
+    The public methods below are exactly the subset of ``ttk.Treeview`` used
+    elsewhere in this module, so existing call sites that already hold a
+    "tree" object keep working unchanged.
+    """
+
+    def __init__(self, main: ttk.Treeview, pinned: ttk.Treeview, pinned_column: str, has_tree_column: bool) -> None:
+        """Wrap ``main`` (scrollable) and ``pinned`` (frozen last column)."""
+        self.main = main
+        self.pinned = pinned
+        self._pinned_column = pinned_column
+        main.bind("<<TreeviewSelect>>", self._on_main_select, add="+")
+        pinned.bind("<<TreeviewSelect>>", self._on_pinned_select, add="+")
+        if has_tree_column:
+            # Only a grouped/hierarchical table (e.g. "重复文件") needs this:
+            # expanding/collapsing a group in ``main`` must show/hide the same
+            # rows in ``pinned``, or the two tables drift out of alignment.
+            main.bind("<<TreeviewOpen>>", self._on_main_open, add="+")
+            main.bind("<<TreeviewClose>>", self._on_main_close, add="+")
+
+    # -- selection kept in sync in both directions -------------------------
+    # ``<<TreeviewSelect>>`` is dispatched through Tk's event queue rather
+    # than fired synchronously inside ``selection_set()``, so a simple
+    # re-entrancy boolean does not stop the two handlers from bouncing the
+    # event back and forth forever. Comparing against the current selection
+    # before writing does: once both sides already agree, neither handler
+    # issues another ``selection_set()``, so the chain terminates by itself.
+    def _on_main_select(self, _event: Any = None) -> None:
+        target = tuple(i for i in self.main.selection() if self.pinned.exists(i))
+        if self.pinned.selection() != target:
+            self.pinned.selection_set(target)
+
+    def _on_pinned_select(self, _event: Any = None) -> None:
+        target = tuple(i for i in self.pinned.selection() if self.main.exists(i))
+        if self.main.selection() != target:
+            self.main.selection_set(target)
+
+    # -- expand / collapse kept in sync (grouped tables only) -------------- #
+    def _on_main_open(self, _event: Any = None) -> None:
+        iid = self.main.focus()
+        if iid and self.pinned.exists(iid):
+            self.pinned.item(iid, open=True)
+
+    def _on_main_close(self, _event: Any = None) -> None:
+        iid = self.main.focus()
+        if iid and self.pinned.exists(iid):
+            self.pinned.item(iid, open=False)
+
+    # -- mutating API, mirrored onto both Treeviews ------------------------ #
+    def insert(
+        self, parent: str = "", index: Any = "end", iid: Optional[str] = None,
+        text: str = "", values: Sequence[Any] = (), open: bool = False, tags: Sequence[str] = (),  # noqa: A002
+    ) -> str:
+        values = tuple(values)
+        main_values = values[:-1]
+        pinned_value = (values[-1],) if values else ("",)
+        new_iid = self.main.insert(parent, index, iid=iid, text=text, values=main_values, open=open, tags=tags)
+        self.pinned.insert(parent, index, iid=new_iid, values=pinned_value, open=open, tags=tags)
+        return new_iid
+
+    def delete(self, *items: str) -> None:
+        main_items = [i for i in items if self.main.exists(i)]
+        pinned_items = [i for i in items if self.pinned.exists(i)]
+        if main_items:
+            self.main.delete(*main_items)
+        if pinned_items:
+            self.pinned.delete(*pinned_items)
+
+    def set(self, iid: str, column: str, value: Any = None) -> Any:
+        target = self.pinned if column == self._pinned_column else self.main
+        return target.set(iid, column, value)
+
+    def item(self, iid: str, **kwargs: Any) -> Any:
+        result = self.main.item(iid, **kwargs)
+        mirrored = {k: v for k, v in kwargs.items() if k in ("tags", "open")}
+        if mirrored and self.pinned.exists(iid):
+            self.pinned.item(iid, **mirrored)
+        return result
+
+    def tag_configure(self, tag: str, **kwargs: Any) -> None:
+        self.main.tag_configure(tag, **kwargs)
+        self.pinned.tag_configure(tag, **kwargs)
+
+    def get_children(self, item: str = "") -> Tuple[str, ...]:
+        return self.main.get_children(item)
+
+    def exists(self, iid: str) -> bool:
+        return self.main.exists(iid)
+
+    def selection(self) -> Tuple[str, ...]:
+        return self.main.selection()
+
+    def selection_set(self, items: Any) -> None:
+        items = (items,) if isinstance(items, str) else tuple(items)
+        self.main.selection_set(items)
+        self.pinned.selection_set(tuple(i for i in items if self.pinned.exists(i)))
+
+    def see(self, iid: str) -> None:
+        self.main.see(iid)
+        if self.pinned.exists(iid):
+            self.pinned.see(iid)
+
+    def bind(self, sequence: str, func: Callable[..., Any], add: Any = None) -> str:
+        return self.main.bind(sequence, func, add)
+
+    def identify(self, *args: Any, **kwargs: Any) -> Any:
+        return self.main.identify(*args, **kwargs)
+
+    def identify_row(self, y: int) -> str:
+        return self.main.identify_row(y)
+
+    def identify_column(self, x: int) -> str:
+        return self.main.identify_column(x)
+
+    def column(self, col_id: str, **kwargs: Any) -> Any:
+        target = self.pinned if col_id == self._pinned_column else self.main
+        return target.column(col_id, **kwargs)
+
+    def heading(self, col_id: str, **kwargs: Any) -> Any:
+        target = self.pinned if col_id == self._pinned_column else self.main
+        return target.heading(col_id, **kwargs)
+
+
 def make_tree(
     parent: tk.Misc,
     columns: Sequence[Tuple[str, str, int, str]],
@@ -129,34 +368,79 @@ def make_tree(
     show: str = "headings",
     tree_heading: str = "",
     tree_width: int = 200,
-) -> Tuple[ttk.Frame, ttk.Treeview]:
-    """创建带滚动条的 Treeview。columns = (id, 标题, 宽度, 对齐)。"""
+    pin_last_column: bool = False,
+) -> Tuple[ttk.Frame, Any]:
+    """创建带滚动条的 Treeview。columns = (id, 标题, 宽度, 对齐)。
+
+    当列数 >= 2 且 ``pin_last_column`` 为真时，最后一列会被固定在表格
+    容器的右边缘：用第二个窄的 Treeview 单独显示这一列，放在横向滚动条之外，
+    垂直滚动 / 选中状态 / 行颜色标签都会和主表格保持同步，视觉上看起来还是
+    同一张表。只有一列时固定没有意义，会自动退化为普通表格。
+    """
     frame = ttk.Frame(parent)
-    tree = ttk.Treeview(
-        frame,
-        columns=[c[0] for c in columns],
-        show=show,
-        selectmode=selectmode,
-        height=height,
-    )
+    pin = pin_last_column and len(columns) >= 2
+    main_columns = columns[:-1] if pin else columns
+
+    main = _TableTree(frame, columns=[c[0] for c in main_columns], show=show, selectmode=selectmode, height=height)
     if "tree" in show:
-        tree.heading("#0", text=tree_heading)
-        tree.column("#0", width=tree_width, stretch=False)
-    for col_id, title, width, anchor in columns:
-        tree.heading(col_id, text=title)
-        tree.column(col_id, width=width, anchor=anchor, stretch=(anchor == "w" and width >= 200))
-    vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-    hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-    tree.grid(row=0, column=0, sticky="nsew")
-    vsb.grid(row=0, column=1, sticky="ns")
+        main.heading("#0", text=tree_heading.strip(), anchor="w")
+        main.column("#0", width=tree_width, stretch=False)
+    for col_id, title, width, anchor in main_columns:
+        main.heading(col_id, text=title.strip(), anchor=anchor)
+        main.column(col_id, width=width, minwidth=60, anchor=anchor, stretch=False)
+
+    vsb = ttk.Scrollbar(frame, orient="vertical")
+    hsb = ttk.Scrollbar(frame, orient="horizontal", command=main.xview)
+    main.configure(xscrollcommand=hsb.set)
     hsb.grid(row=1, column=0, sticky="ew")
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
-    return frame, tree
+
+    if not pin:
+        main.configure(yscrollcommand=vsb.set)
+        vsb.configure(command=main.yview)
+        main.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        return frame, main
+
+    col_id, title, width, anchor = columns[-1]
+    # "headings" even when ``main`` is "tree headings": the pinned panel only
+    # ever shows one flat data column, never the indentation / disclosure
+    # triangle of a grouped table.
+    pinned = _TableTree(frame, columns=[col_id], show="headings", selectmode=selectmode, height=height)
+    pinned.heading(col_id, text=title.strip(), anchor=anchor)
+    pinned.column(col_id, width=width, anchor=anchor, stretch=False)
+    pinned.configure(takefocus=0)
+
+    def _sync_vertical(first: str, last: str) -> None:
+        vsb.set(first, last)
+        pinned.yview_moveto(first)
+
+    main.configure(yscrollcommand=_sync_vertical)
+    vsb.configure(command=lambda *args: (main.yview(*args), pinned.yview(*args)))
+
+    def _redirect_wheel_to_main(event: Any) -> str:
+        # Scrolling while the mouse is over the frozen column must still
+        # scroll the table (and, via main's yscrollcommand above, pinned too).
+        if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            main.yview_scroll(1, "units")
+        elif getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            main.yview_scroll(-1, "units")
+        return "break"
+
+    pinned.bind("<MouseWheel>", _redirect_wheel_to_main)
+    pinned.bind("<Button-4>", _redirect_wheel_to_main)
+    pinned.bind("<Button-5>", _redirect_wheel_to_main)
+
+    main.grid(row=0, column=0, sticky="nsew")
+    pinned.grid(row=0, column=1, sticky="ns")
+    vsb.grid(row=0, column=2, sticky="ns")
+
+    wrapper = _PinnedColumnTree(main, pinned, pinned_column=col_id, has_tree_column=("tree" in show))
+    return frame, wrapper
 
 
-def clear_tree(tree: ttk.Treeview) -> None:
+def clear_tree(tree: Any) -> None:
     tree.delete(*tree.get_children())
 
 
@@ -186,7 +470,7 @@ class App(tk.Tk):
         self.org_checked: Dict[str, bool] = {}
         self.org_root: Optional[Path] = None
         self.dup_groups: List[DuplicateGroup] = []
-        self.dup_keep: Dict[int, Optional[int]] = {}
+        self.dup_checked: Set[Tuple[int, int]] = set()
         self.dup_root: Optional[Path] = None
         self.clean_dirs: List[Path] = []
         self.clean_root: Optional[Path] = None
@@ -276,8 +560,9 @@ class App(tk.Tk):
         status_row.pack(fill="x", pady=(4, 2))
         self.status_var = tk.StringVar(value="空闲")
         ttk.Label(status_row, textvariable=self.status_var).pack(side="left")
+        # 只在真的有后台任务（扫描 / 生成预览 / 测试连接…）运行时才显示，
+        # 空闲时收起来，避免在界面上留下一条看起来没用的占位横线。
         self.progress = ttk.Progressbar(status_row, mode="indeterminate", length=180)
-        self.progress.pack(side="right")
         log_frame = ttk.Frame(bottom)
         log_frame.pack(fill="x")
         self.log_text = tk.Text(log_frame, height=5, wrap="word", state="disabled", relief="solid", borderwidth=1)
@@ -298,6 +583,7 @@ class App(tk.Tk):
             ("大 / 小文件", self._build_size_tab),
             ("撤销历史", self._build_undo_tab),
             ("分类规则", self._build_rules_tab),
+            ("AI 缓存", self._build_cache_tab),
             ("设置", self._build_settings_tab),
         ]
         for title, builder in builders:
@@ -310,7 +596,7 @@ class App(tk.Tk):
         text = self.notebook.tab(self.notebook.select(), "text").strip()
         if text == "撤销历史":
             self.refresh_undo_logs()
-        elif text == "设置":
+        elif text == "AI 缓存":
             self.refresh_cache_stats()
 
     # ------------------------------------------------------------------ #
@@ -343,6 +629,7 @@ class App(tk.Tk):
             return False
         self.busy = True
         self.status_var.set(text)
+        self.progress.pack(side="right")
         self.progress.start(12)
         self.log(text)
 
@@ -374,6 +661,7 @@ class App(tk.Tk):
     def _finish_task(self, done: Callable[[Any], None], result: Any, error: Any) -> None:
         self.busy = False
         self.progress.stop()
+        self.progress.pack_forget()
         if error is not None:
             exc, trace = error
             self.status_var.set("失败")
@@ -564,14 +852,12 @@ class App(tk.Tk):
         panes = ttk.Frame(tab)
         panes.pack(fill="both", expand=True, pady=(8, 0))
         left_frame, self.scan_summary = make_tree(
-            panes, [("metric", "指标", 160, "w"), ("value", "数值", 220, "e")], height=10, selectmode="none"
+            panes, [("metric", "指标", 160, "w"), ("value", "数值", 220, "w")], height=10, selectmode="none"
         )
         right_frame, self.scan_ext = make_tree(
             panes, [("ext", "扩展名", 140, "w"), ("count", "文件数", 90, "e"), ("size", "总大小", 120, "e")],
             height=10, selectmode="none",
         )
-        self.scan_summary.column("value", stretch=True)
-        self.scan_ext.column("size", stretch=True)
         left_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
         right_frame.pack(side="left", fill="both", expand=True)
 
@@ -648,7 +934,7 @@ class App(tk.Tk):
             height=14,
         )
         frame.pack(fill="both", expand=True)
-        self.org_tree.bind("<Button-1>", self._org_click)
+        self.org_tree.bind("<Button-1>", self._org_click, add="+")
 
     def do_org_plan(self) -> None:
         root = self.get_root()
@@ -782,38 +1068,46 @@ class App(tk.Tk):
         top = ttk.Frame(tab)
         top.pack(fill="x")
         self.dup_empty_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="包含 0 字节文件", variable=self.dup_empty_var).pack(side="left")
-        ttk.Button(top, text="查找重复文件", command=self.do_dup_find).pack(side="left", padx=10)
         self.dup_dry_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="仅模拟", variable=self.dup_dry_var).pack(side="left")
-        ttk.Button(top, text="把未保留的移入回收站", style="Danger.TButton", command=self.do_dup_execute).pack(
-            side="right"
+        ttk.Button(top, text="扫描重复文件", command=self.do_dup_find).pack(side="left")
+        choose = ttk.Menubutton(top, text="选择方式")
+        choose_menu = tk.Menu(choose, tearoff=False)
+        choose_menu.add_command(label="每组保留最新，选其余副本", command=self._dup_auto_select)
+        choose_menu.add_command(label="全选文件", command=self._dup_select_all)
+        choose_menu.add_command(label="取消选择", command=self._dup_clear_selection)
+        choose["menu"] = choose_menu
+        choose.pack(side="left", padx=6)
+        more = ttk.Menubutton(top, text="更多")
+        more_menu = tk.Menu(more, tearoff=False)
+        more_menu.add_checkbutton(label="包含 0 字节文件", variable=self.dup_empty_var)
+        more_menu.add_checkbutton(label="仅模拟处理", variable=self.dup_dry_var)
+        more_menu.add_command(label="定位所选文件", command=self._dup_reveal)
+        more_menu.configure(postcommand=lambda: more_menu.entryconfigure(
+            "定位所选文件", state="normal" if self.dup_tree.selection() or self.dup_checked else "disabled"
+        ))
+        more["menu"] = more_menu
+        more.pack(side="left")
+        self.dup_execute_button = ttk.Button(
+            top, text="处理所选文件", style="Danger.TButton", command=self.do_dup_execute, state="disabled"
         )
-
-        tools = ttk.Frame(tab)
-        tools.pack(fill="x", pady=(6, 0))
-        ttk.Button(tools, text="保留所选这一份", command=self._dup_keep_selected).pack(side="left")
-        ttk.Button(tools, text="跳过所选的组", command=self._dup_skip_selected).pack(side="left", padx=6)
-        ttk.Button(tools, text="全部重置为保留最新", command=self._dup_reset).pack(side="left")
-        ttk.Button(tools, text="定位文件", command=self._dup_reveal).pack(side="left", padx=6)
+        self.dup_execute_button.pack(side="right")
         self.dup_summary_var = tk.StringVar(value="点击“查找重复文件”（先按大小分组，再比对 SHA-256）。")
         ttk.Label(tab, textvariable=self.dup_summary_var, style="Hint.TLabel").pack(fill="x", pady=6)
 
         frame, self.dup_tree = make_tree(
             tab,
             [
-                ("state", "处理", 90, "center"),
-                ("path", "路径", 520, "w"),
-                ("size", "大小", 90, "e"),
-                ("mtime", "修改时间", 150, "center"),
+                ("state", "选择", 70, "center"),
+                ("path", "路径", 390, "w"),
+                ("size", "大小", 85, "e"),
+                ("mtime", "修改时间", 155, "center"),
             ],
-            height=14, show="tree headings", tree_heading="分组", tree_width=340,
+            height=14, show="tree headings", tree_heading="分组", tree_width=210,
+            pin_last_column=True,
         )
         frame.pack(fill="both", expand=True)
-        self.dup_tree.tag_configure("keep", foreground="#1b7f3b")
         self.dup_tree.tag_configure("trash", foreground="#b00020")
-        self.dup_tree.tag_configure("skip", foreground="#888888")
-        self.dup_tree.bind("<Double-1>", lambda _e: self._dup_keep_selected())
+        self.dup_tree.bind("<Button-1>", self._dup_click, add="+")
 
     def do_dup_find(self) -> None:
         root = self.get_root()
@@ -832,7 +1126,7 @@ class App(tk.Tk):
             result, groups = payload
             self.dup_root = root
             self.dup_groups = groups
-            self.dup_keep = {i: 0 for i in range(len(groups))}  # 组内已按修改时间降序，0 即最新
+            self.dup_checked: Set[Tuple[int, int]] = set()
             clear_tree(self.dup_tree)
             for index, group in enumerate(groups):
                 gid = "g%d" % index
@@ -844,8 +1138,6 @@ class App(tk.Tk):
                         values=("", str(info.path), info.size_text, info.mtime_text),
                     )
                 self._dup_refresh_group(index)
-            if not groups:
-                self.dup_summary_var.set("扫描了 %d 个文件，没有发现重复文件。" % len(result.files))
             self.log("重复文件查找完成：%d 组" % len(groups))
             self._dup_update_summary()
 
@@ -853,33 +1145,31 @@ class App(tk.Tk):
 
     def _dup_refresh_group(self, index: int) -> None:
         group = self.dup_groups[index]
-        keep = self.dup_keep.get(index)
         gid = "g%d" % index
-        label = "第 %d 组 · %d 份 · %s · 可回收 %s" % (
-            index + 1, len(group.files), human_readable_size(group.size), group.recoverable_text
-        )
+        label = "第 %d 组 · %d 份 · %s" % (index + 1, len(group.files), human_readable_size(group.size))
         self.dup_tree.item(gid, text=label)
-        self.dup_tree.set(gid, "state", "已跳过" if keep is None else "")
         for pos in range(len(group.files)):
             cid = "g%d_%d" % (index, pos)
-            if keep is None:
-                self.dup_tree.set(cid, "state", "— 跳过")
-                self.dup_tree.item(cid, tags=("skip",))
-            elif pos == keep:
-                self.dup_tree.set(cid, "state", "✔ 保留")
-                self.dup_tree.item(cid, tags=("keep",))
-            else:
-                self.dup_tree.set(cid, "state", "🗑 回收站")
-                self.dup_tree.item(cid, tags=("trash",))
+            checked = (index, pos) in self.dup_checked
+            self.dup_tree.set(cid, "state", CHECK_ON if checked else CHECK_OFF)
+            self.dup_tree.item(cid, tags=("trash",) if checked else ())
 
     def _dup_update_summary(self) -> None:
+        selected = len(self.dup_checked)
+        button = getattr(self, "dup_execute_button", None)
+        if button is not None:
+            button.configure(state="normal" if selected else "disabled")
         if not self.dup_groups:
+            self.dup_summary_var.set("没有发现重复文件。")
             return
         stats = DuplicateChecker.summarize(self.dup_groups)
-        pending = sum(len(g.files) - 1 for i, g in enumerate(self.dup_groups) if self.dup_keep.get(i) is not None)
+        bytes_selected = sum(self.dup_groups[g].files[p].size for g, p in self.dup_checked)
+        unsafe = any(all((g, p) in self.dup_checked for p in range(len(group.files)))
+                     for g, group in enumerate(self.dup_groups))
         self.dup_summary_var.set(
-            "共 %d 组重复，%d 份冗余，最多可回收 %s｜当前将移入回收站：%d 个文件。单击/双击某份文件可改为保留它。"
-            % (stats["groups"], stats["redundant"], stats["wasted_text"], pending)
+            "共 %d 组重复｜已选 %d 个文件｜清空回收站后可释放 %s。点击文件前的方框可调整。%s"
+            % (stats["groups"], selected, human_readable_size(bytes_selected),
+               "每组至少须留一份，请取消部分选择。" if unsafe else "处理时默认移入程序回收站。")
         )
 
     def _dup_parse(self, iid: str) -> Tuple[int, Optional[int]]:
@@ -889,35 +1179,46 @@ class App(tk.Tk):
             return int(g), int(p)
         return int(body), None
 
-    def _dup_keep_selected(self) -> None:
-        touched: Set[int] = set()
-        for iid in self.dup_tree.selection():
-            g, p = self._dup_parse(iid)
-            if p is not None:
-                self.dup_keep[g] = p
-                touched.add(g)
-        for g in touched:
-            self._dup_refresh_group(g)
+    def _dup_click(self, event: Any) -> Optional[str]:
+        if (self.dup_tree.identify("region", event.x, event.y) != "cell"
+                or self.dup_tree.identify_column(event.x) != "#1"):
+            return None
+        iid = self.dup_tree.identify_row(event.y)
+        if not iid or "_" not in iid:
+            return None
+        g, p = self._dup_parse(iid)
+        key = (g, p)
+        if key in self.dup_checked:
+            self.dup_checked.remove(key)
+        else:
+            self.dup_checked.add(key)
+        self._dup_refresh_group(g)
         self._dup_update_summary()
+        return "break"
 
-    def _dup_skip_selected(self) -> None:
-        touched: Set[int] = set()
-        for iid in self.dup_tree.selection():
-            g, _p = self._dup_parse(iid)
-            self.dup_keep[g] = None
-            touched.add(g)
-        for g in touched:
-            self._dup_refresh_group(g)
-        self._dup_update_summary()
-
-    def _dup_reset(self) -> None:
+    def _dup_auto_select(self) -> None:
+        self.dup_checked = {(g, p) for g, group in enumerate(self.dup_groups)
+                            for p in range(1, len(group.files))}
         for index in range(len(self.dup_groups)):
-            self.dup_keep[index] = 0
+            self._dup_refresh_group(index)
+        self._dup_update_summary()
+
+    def _dup_select_all(self) -> None:
+        self.dup_checked = {(g, p) for g, group in enumerate(self.dup_groups)
+                            for p in range(len(group.files))}
+        for index in range(len(self.dup_groups)):
+            self._dup_refresh_group(index)
+        self._dup_update_summary()
+
+    def _dup_clear_selection(self) -> None:
+        self.dup_checked.clear()
+        for index in range(len(self.dup_groups)):
             self._dup_refresh_group(index)
         self._dup_update_summary()
 
     def _dup_reveal(self) -> None:
-        for iid in self.dup_tree.selection():
+        picked = self.dup_tree.selection() or tuple("g%d_%d" % key for key in sorted(self.dup_checked))
+        for iid in picked:
             g, p = self._dup_parse(iid)
             if p is not None:
                 open_in_os(Path(self.dup_groups[g].files[p].path), select=True)
@@ -927,15 +1228,26 @@ class App(tk.Tk):
         if not self.dup_groups or self.dup_root is None:
             messagebox.showinfo("提示", "请先查找重复文件。", parent=self)
             return
+        if not self.dup_checked:
+            messagebox.showinfo("提示", "请先勾选要处理的文件。", parent=self)
+            return
         actions: List[PlannedAction] = []
+        checks: List[Tuple[DuplicateGroup, FileInfo, List[FileInfo]]] = []
+        selected_bytes = 0
         for index, group in enumerate(self.dup_groups):
-            keep = self.dup_keep.get(index)
-            if keep is None:
+            selected = [p for p in range(len(group.files)) if (index, p) in self.dup_checked]
+            if not selected:
                 continue
-            keeper = group.files[keep]
-            for info in group.files:
-                if info is keeper:
-                    continue
+            remaining = [info for p, info in enumerate(group.files) if p not in selected]
+            if not remaining:
+                messagebox.showinfo("提示", "第 %d 组全部勾选了，请至少保留一份。" % (index + 1), parent=self)
+                return
+            keeper = remaining[0]
+            selected_files = [group.files[pos] for pos in selected]
+            checks.append((group, keeper, selected_files))
+            selected_bytes += sum(info.size for info in selected_files)
+            for pos in selected:
+                info = group.files[pos]
                 actions.append(
                     PlannedAction(
                         action=ACTION_DELETE,
@@ -943,19 +1255,31 @@ class App(tk.Tk):
                         reason="duplicate of %s (sha256:%s)" % (keeper.path, group.short_hash),
                     )
                 )
-        if not actions:
-            messagebox.showinfo("提示", "没有需要处理的文件。", parent=self)
-            return
         dry = bool(self.dup_dry_var.get())
-        if not dry and not self.confirm_destructive("将有 %d 个重复文件被移入回收站。" % len(actions)):
+        if not dry and not self.confirm_destructive(
+            "将有 %d 个重复文件（%s）被移入回收站，每组至少保留一份。"
+            % (len(actions), human_readable_size(selected_bytes))
+        ):
             return
         executor = self.new_executor(self.dup_root, dry_run=dry)
-        self.run_task(lambda: executor.execute(actions), self._dup_done, "正在处理重复文件…")
+
+        def work() -> Any:
+            for group, keeper, selected_files in checks:
+                if chunked_hash(keeper.path) != group.hash_value or any(
+                    chunked_hash(info.path) != group.hash_value for info in selected_files
+                ):
+                    raise RuntimeError("文件内容已变化，请重新扫描重复文件后再处理。")
+            return executor.execute(actions)
+
+        self.run_task(work, self._dup_done, "正在处理重复文件…")
 
     def _dup_done(self, outcome: Any) -> None:
         self.show_outcome("重复文件处理结果", self._outcome_rows(outcome), outcome.actions)
         self.dup_groups = []
-        self.dup_keep = {}
+        self.dup_checked = set()
+        button = getattr(self, "dup_execute_button", None)
+        if button is not None:
+            button.configure(state="disabled")
         clear_tree(self.dup_tree)
         self.dup_summary_var.set("已处理。可重新查找确认结果，或到“撤销历史”还原。")
 
@@ -1325,7 +1649,27 @@ class App(tk.Tk):
             messagebox.showerror("保存失败", "无法写入 %s" % self.config.path, parent=self)
 
     # ------------------------------------------------------------------ #
-    # 页签 8：设置（AI / 安全 / 缓存）
+    # 页签 8：AI 缓存
+    # ------------------------------------------------------------------ #
+    def _build_cache_tab(self, tab: ttk.Frame) -> None:
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        self.cache_var = tk.StringVar(value="本程序缓存记录：0 条")
+        ttk.Label(top, textvariable=self.cache_var).pack(side="left")
+        ttk.Button(top, text="清空缓存", command=self.clear_cache).pack(side="right")
+        ttk.Button(top, text="刷新", command=self.refresh_cache_stats).pack(side="right", padx=6)
+        ttk.Label(tab, text="仅显示本程序保存的 AI 分类结果；清空后再次分类可能重新调用 AI。",
+                  style="Hint.TLabel").pack(anchor="w", pady=(6, 8))
+        frame, self.cache_tree = make_tree(
+            tab,
+            [("name", "文件名", 420, "w"), ("category", "分类", 190, "w"),
+             ("source", "来源", 100, "center"), ("created", "缓存时间", 180, "center")],
+            height=15, selectmode="browse",
+        )
+        frame.pack(fill="both", expand=True)
+
+    # ------------------------------------------------------------------ #
+    # 页签 9：设置（AI / 安全）
     # ------------------------------------------------------------------ #
     def _build_settings_tab(self, tab: ttk.Frame) -> None:
         ai = ttk.LabelFrame(tab, text="AI 分类（只发送文件名，不发送文件内容）", padding=10)
@@ -1421,12 +1765,6 @@ class App(tk.Tk):
         ttk.Button(btns, text="保存设置", command=self.save_settings).pack(side="left")
         ttk.Button(btns, text="打开配置文件所在目录", command=lambda: open_in_os(self.work_dir)).pack(side="left", padx=8)
 
-        cache = ttk.LabelFrame(tab, text="AI 分类缓存", padding=10)
-        cache.pack(fill="x", pady=8)
-        self.cache_var = tk.StringVar(value="")
-        ttk.Label(cache, textvariable=self.cache_var, justify="left").pack(side="left")
-        ttk.Button(cache, text="清空缓存", command=self.clear_cache).pack(side="right")
-        ttk.Button(cache, text="刷新", command=self.refresh_cache_stats).pack(side="right", padx=6)
         self.load_settings()
 
     # -- 服务商切换 / 读写辅助 ------------------------------------------- #
@@ -1582,13 +1920,18 @@ class App(tk.Tk):
 
     def refresh_cache_stats(self) -> None:
         with CacheStore(self.work_dir / "ai_cache.db") as store:
-            stats = store.stats()
-        top = sorted((stats.get("by_category") or {}).items(), key=lambda kv: -kv[1])[:6]
-        extra = "　".join("%s %d" % kv for kv in top)
-        self.cache_var.set("后端：%s｜条目：%s%s" % (stats["mode"], stats["entries"], ("\n分类：" + extra) if extra else ""))
+            entries = store.list_entries()
+        clear_tree(self.cache_tree)
+        for index, (name, category, source, stamp) in enumerate(entries):
+            self.cache_tree.insert(
+                "", "end", iid=str(index),
+                values=(name, category, SOURCE_TEXT.get(source, source),
+                        time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))),
+            )
+        self.cache_var.set("本程序缓存记录：%d 条" % len(entries))
 
     def clear_cache(self) -> None:
-        if not messagebox.askyesno("确认", "清空全部 AI 分类缓存？之后相同文件名会重新调用 AI。", parent=self):
+        if not messagebox.askyesno("确认", "清空本程序的全部 AI 分类缓存？之后相同文件名会重新调用 AI。", parent=self):
             return
         with CacheStore(self.work_dir / "ai_cache.db") as store:
             removed = store.clear()

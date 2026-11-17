@@ -42,6 +42,30 @@ def test_ai_response_is_validated_cached_and_reused(tmp_path: Path, monkeypatch)
     assert len(requests) == 1
 
 
+def test_ai_cache_survives_reopening_without_another_request(tmp_path: Path, monkeypatch) -> None:
+    config = Config(tmp_path / "config.json")
+    config.set("ai.providers.openai.api_key", "test-only")
+    requests = []
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"0": "Documents"}'))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=lambda **kwargs: client))
+    path = tmp_path / "ai_cache.db"
+    with CacheStore(path) as store:
+        assert AIClassifier(config, store).classify_names(["project.unknown"])[0] == {
+            "project.unknown": "Documents"
+        }
+    with CacheStore(path) as store:
+        resolved, sources = AIClassifier(config, store).classify_names(["project.unknown"])
+
+    assert resolved == {"project.unknown": "Documents"}
+    assert sources == {"project.unknown": SOURCE_CACHE}
+    assert len(requests) == 1
+
+
 def test_ai_file_limit_and_failed_request_do_not_hammer_endpoint(tmp_path: Path) -> None:
     config = Config(tmp_path / "config.json")
     config.set("ai.max_files", 3)

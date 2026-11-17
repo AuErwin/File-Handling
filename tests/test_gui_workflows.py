@@ -5,6 +5,8 @@ import queue
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from file_organizer.config import DEFAULT_EXTENSION_MAP, Config
 from file_organizer.executor import Executor
 from file_organizer.gui import App, messagebox, simpledialog
@@ -28,6 +30,8 @@ class Tree:
     def __init__(self):
         self.rows = {}
         self.selected = ()
+        self.cells = {}
+        self.hit_row = ""
 
     def get_children(self):
         return tuple(self.rows)
@@ -50,7 +54,16 @@ class Tree:
         pass
 
     def set(self, iid, column, value):
-        pass
+        self.cells[(iid, column)] = value
+
+    def identify(self, region, x, y):
+        return "cell"
+
+    def identify_column(self, x):
+        return "#1"
+
+    def identify_row(self, y):
+        return self.hit_row
 
     def exists(self, iid):
         return iid in self.rows
@@ -197,6 +210,8 @@ def test_gui_duplicate_cleanup_keeps_one_copy_and_can_undo(tmp_path: Path) -> No
     second = root / "second.txt"
     first.write_bytes(b"same")
     second.write_bytes(b"same")
+    button = SimpleNamespace(state="disabled")
+    button.configure = lambda **kwargs: setattr(button, "state", kwargs["state"])
     app = SimpleNamespace(
         config=Config(tmp_path / "config.json"),
         log_dir=tmp_path / "logs",
@@ -204,6 +219,7 @@ def test_gui_duplicate_cleanup_keeps_one_copy_and_can_undo(tmp_path: Path) -> No
         dup_summary_var=Value(""),
         dup_empty_var=Value(False),
         dup_dry_var=Value(False),
+        dup_execute_button=button,
     )
     app.get_root = lambda: root
     app.extra_excludes = lambda: set()
@@ -224,16 +240,63 @@ def test_gui_duplicate_cleanup_keeps_one_copy_and_can_undo(tmp_path: Path) -> No
     App.do_dup_find(app)
     assert len(app.dup_groups) == 1
     assert len(app.dup_groups[0].files) == 2
-    app.dup_tree.selection_set("g0_1")
-    App._dup_keep_selected(app)
-    assert app.dup_keep[0] == 1
-    App._dup_skip_selected(app)
-    assert app.dup_keep[0] is None
-    App._dup_reset(app)
-    assert app.dup_keep[0] == 0
+    assert not app.dup_checked
+    assert button.state == "disabled"
+    App._dup_auto_select(app)
+    assert app.dup_checked == {(0, 1)}
+    assert button.state == "normal"
+    assert "已选 1 个文件" in app.dup_summary_var.get()
+    App._dup_clear_selection(app)
+    assert not app.dup_checked
+    assert button.state == "disabled"
+    app.dup_tree.hit_row = "g0_1"
+    assert App._dup_click(app, SimpleNamespace(x=0, y=0)) == "break"
+    assert app.dup_checked == {(0, 1)}
+    assert app.dup_tree.cells[("g0_1", "state")] == "☑"
+    App._dup_select_all(app)
+    assert len(app.dup_checked) == 2
+    with pytest.MonkeyPatch.context() as patch:
+        messages = []
+        patch.setattr(messagebox, "showinfo", lambda *args, **kwargs: messages.append(args[1]))
+        App.do_dup_execute(app)
+    assert "至少保留一份" in messages[0]
+    assert first.exists() and second.exists()
+    App._dup_auto_select(app)
     App.do_dup_execute(app)
     assert first.exists() != second.exists()
     assert UndoManager(app.log_dir).restore().restored == 1
+    assert first.exists() and second.exists()
+
+
+def test_duplicate_cleanup_refuses_changed_content(tmp_path: Path) -> None:
+    root = tmp_path / "files"
+    root.mkdir()
+    first = root / "first.bin"
+    second = root / "second.bin"
+    first.write_bytes(b"same")
+    second.write_bytes(b"same")
+    app = SimpleNamespace(
+        config=Config(tmp_path / "config.json"), log_dir=tmp_path / "logs",
+        dup_tree=Tree(), dup_summary_var=Value(""), dup_empty_var=Value(False), dup_dry_var=Value(False),
+    )
+    app.get_root = lambda: root
+    app.extra_excludes = lambda: set()
+    app.trash_dir_for = lambda folder: folder / ".file_organizer_trash"
+    app.scan_tree = lambda folder, excludes: App.scan_tree(app, folder, excludes)
+    app.set_status = app.log = lambda text: None
+    app.run_task = lambda work, done, status: done(work())
+    app._dup_refresh_group = lambda index: App._dup_refresh_group(app, index)
+    app._dup_update_summary = lambda: App._dup_update_summary(app)
+    app._dup_done = lambda outcome: None
+    app.new_executor = lambda folder, dry_run=False: App.new_executor(app, folder, dry_run)
+    app.confirm_destructive = lambda summary: True
+    App.do_dup_find(app)
+    App._dup_auto_select(app)
+    changed = app.dup_groups[0].files[1].path
+    changed.write_bytes(b"DIFFERENT")
+
+    with pytest.raises(RuntimeError, match="文件内容已变化"):
+        App.do_dup_execute(app)
     assert first.exists() and second.exists()
 
 
@@ -446,7 +509,10 @@ def test_gui_task_queue_delivers_results_and_errors(monkeypatch) -> None:
         busy=False,
         events=queue.Queue(),
         status_var=Value(""),
-        progress=SimpleNamespace(start=lambda delay: None, stop=lambda: None),
+        progress=SimpleNamespace(
+            start=lambda delay: None, stop=lambda: None,
+            pack=lambda **kwargs: None, pack_forget=lambda: None,
+        ),
     )
     logs = []
     results = []
@@ -513,12 +579,13 @@ def test_gui_cache_clear_needs_confirmation(tmp_path: Path, monkeypatch) -> None
     work_dir = tmp_path / "work"
     with CacheStore(work_dir / "ai_cache.db") as store:
         store.set("a", "Images")
-    app = SimpleNamespace(work_dir=work_dir, cache_var=Value(""))
+    app = SimpleNamespace(work_dir=work_dir, cache_var=Value(""), cache_tree=Tree())
     messages = []
     app.log = messages.append
     app.refresh_cache_stats = lambda: App.refresh_cache_stats(app)
     App.refresh_cache_stats(app)
-    assert "条目：1" in app.cache_var.get()
+    assert "1 条" in app.cache_var.get()
+    assert app.cache_tree.rows["0"][:2] == ("", "Images")
 
     monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: False)
     App.clear_cache(app)
@@ -527,5 +594,6 @@ def test_gui_cache_clear_needs_confirmation(tmp_path: Path, monkeypatch) -> None
 
     monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: True)
     App.clear_cache(app)
-    assert "条目：0" in app.cache_var.get()
+    assert "0 条" in app.cache_var.get()
+    assert not app.cache_tree.rows
     assert "已清除 1 条" in messages[0]

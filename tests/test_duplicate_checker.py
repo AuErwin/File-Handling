@@ -45,6 +45,14 @@ def test_find_ignores_files_with_different_sizes(tmp_path: Path) -> None:
     assert checker.find() == []
 
 
+def test_find_rejects_same_size_with_different_content(tmp_path: Path) -> None:
+    (tmp_path / "copy.txt").write_bytes(b"ABCD")
+    (tmp_path / "other.txt").write_bytes(b"WXYZ")
+
+    files = [_info(tmp_path / "copy.txt"), _info(tmp_path / "other.txt")]
+    assert DuplicateChecker(files).find() == []
+
+
 def test_find_excludes_empty_files_by_default(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("", encoding="utf-8")
     (tmp_path / "b.txt").write_text("", encoding="utf-8")

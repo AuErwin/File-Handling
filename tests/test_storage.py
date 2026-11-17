@@ -17,6 +17,9 @@ def test_cache_persists_updates_and_clears(tmp_path: Path) -> None:
         assert store.get("a") == "Documents"
         assert store.stats()["entries"] == 2
         assert store.stats()["by_category"] == {"Documents": 2}
+        assert {(name, category) for name, category, _, _ in store.list_entries()} == {
+            ("a.jpg", "Documents"), ("b.pdf", "Documents")
+        }
 
     with CacheStore(path) as store:
         assert store.get("a") == "Documents"
@@ -34,6 +37,7 @@ def test_memory_cache_validates_keys_and_can_be_cleared() -> None:
     store.set("a", "Images")
     store.set("b", "Images")
     assert store.stats()["by_category"] == {"Images": 2}
+    assert len(store.list_entries()) == 2
     assert store.clear() == 2
     store.close()
     store.close()
