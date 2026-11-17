@@ -44,7 +44,7 @@
 
 - **建议 Python 3.9–3.12**（GitHub CI 已验证这些版本；3.8 和更新版本未纳入 CI 测试）
 - **macOS 或 Windows**，并安装 Tkinter（GUI 依赖）：
-  - **macOS**：从 [python.org](https://www.python.org/downloads/) 安装的 Python 通常包含 Tk；使用 Homebrew Python 时，如缺少 `_tkinter`，需安装与当前 Python 版本对应的 `python-tk` 组件。
+  - **macOS**：请使用自带新版 Tk 的 Python（如 [python.org](https://www.python.org/downloads/) 安装版）；不要使用系统自带、连接 Tk 8.5 的 `/usr/bin/python3`，它可能让界面显示异常。使用 Homebrew Python 时，如缺少 `_tkinter`，需安装与当前 Python 版本对应的 `python-tk` 组件。
   - **Windows**：从 [python.org](https://www.python.org/downloads/) 安装 Python，并在安装时保留 Tcl/Tk 组件。
 - 全程使用 `pathlib`，不做手工字符串路径拼接
 - 源码及程序写出的 JSON 文本使用 **UTF-8**；SQLite 缓存是数据库文件，原有用户文件不会被转换编码
@@ -56,9 +56,12 @@
 **macOS：**
 
 ```bash
+python3 -c 'import sys, tkinter; print(sys.executable, tkinter.TkVersion)'
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
+
+第一行应显示 Tk 8.6 或更新版本。如果显示 Tk 8.5，请将第二行的 `python3` 换成已安装的新版 Python 命令或完整路径，再创建 `.venv`。已有的 `.venv` 不会因切换 `python3` 自动更新，需先删除旧环境再重新创建。
 
 **Windows（PowerShell）：**
 
@@ -73,14 +76,19 @@ python -m venv .venv
 
 ## 运行
 
-在项目根目录执行（macOS）：
+在项目根目录使用刚安装依赖的虚拟环境运行。
+
+**macOS：**
 
 ```bash
 .venv/bin/python main.py
 ```
 
-- Windows PowerShell 使用 `.\.venv\Scripts\python.exe main.py`；想避免弹出控制台窗口，可用 `.\.venv\Scripts\pythonw.exe main.py`。
-- 首次启动会在 `~/.file_organizer/` 下创建配置目录（见下文）。
+**Windows（PowerShell）：**
+
+```powershell
+.\.venv\Scripts\python.exe main.py
+```
 
 ## 界面功能说明
 
@@ -289,6 +297,9 @@ python -m venv .venv
 
 **启动后提示缺少 `_tkinter`？**
 按上文“环境要求”安装 Tkinter。macOS 运行 `.venv/bin/python -m tkinter`，Windows PowerShell 运行 `.\.venv\Scripts\python.exe -m tkinter`；能够弹出测试窗口即表示安装成功。
+
+**macOS 启动后窗口空白或显示异常？**
+运行 `.venv/bin/python -c 'import sys, tkinter; print(sys.executable, tkinter.TkVersion)'`。如果显示 Tk 8.5，说明虚拟环境用了系统自带的旧版 Tk。删除 `.venv`，再用带 Tk 8.6 或更新版本的 Python 按“安装”一节重新创建。安装 `requirements.txt` 只会安装 Python 依赖，不会升级 Tk。
 
 **AI 分类一直落到 `Others`？**
 依次检查：是否已在"设置 → AI 分类"中启用并选对服务商；API Key 是否按上文"查找顺序"配置正确；"测试连接"是否成功；网络/代理是否可达对应服务商的 Base URL。

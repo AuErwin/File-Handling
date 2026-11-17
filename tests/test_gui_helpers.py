@@ -5,10 +5,17 @@ from pathlib import Path
 
 from file_organizer.gui import (
     PREVIEW_LIMIT,
+    initial_window_geometry,
     list_folder_entries,
     log_belongs_to_root,
     read_text_preview,
 )
+
+
+def test_initial_window_is_centered_with_room_around_it() -> None:
+    assert initial_window_geometry(2000, 1300) == "1360x975+320+162"
+    assert initial_window_geometry(1366, 768) == "960x620+203+74"
+    assert initial_window_geometry(800, 600) == "760x520+20+40"
 
 
 def test_text_preview_handles_utf8_bom_binary_and_invalid_text(tmp_path: Path) -> None:

@@ -51,6 +51,30 @@ CHECK_ON = "☑"
 CHECK_OFF = "☐"
 SOURCE_TEXT = {"rule": "规则", "ai": "AI", "cache": "缓存", "unknown": "未识别"}
 PREVIEW_LIMIT = 64 * 1024
+BG = "#ffffff"
+SURFACE = "#ffffff"
+FIELD = "#ffffff"
+TEXT = "#202b3a"
+MUTED = "#5f6b7a"
+BORDER = "#cbd3dd"
+ACCENT = "#176bc1"
+
+
+def initial_window_geometry(screen_width: int, screen_height: int) -> str:
+    """Open at a readable, centered size with room around the window."""
+    width = min(max(1, screen_width - 40), max(960, int(screen_width * 0.68)))
+    height = min(max(1, screen_height - 80), max(620, int(screen_height * 0.75)))
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    return f"{width}x{height}+{x}+{y}"
+
+
+def make_menu(parent: tk.Misc) -> tk.Menu:
+    return tk.Menu(
+        parent, tearoff=False, background=SURFACE, foreground=TEXT,
+        activebackground=ACCENT, activeforeground="#ffffff", selectcolor=TEXT,
+        font=tkfont.nametofont("TkMenuFont"),
+    )
 
 
 def read_text_preview(path: Path) -> str:
@@ -235,10 +259,12 @@ def make_tree(
     show: str = "headings",
     tree_heading: str = "",
     tree_width: int = 200,
+    equal_columns: bool = False,
+    expand_column: str = "",
 ) -> Tuple[ttk.Frame, _TableTree]:
     """创建列宽随容器调整的 Treeview。columns = (id, 标题, 宽度, 对齐)。
 
-    所有列位于同一张表中；最后一列保持原宽度，其余列填满剩余空间。
+    所有列位于同一张表中；可选等宽或指定伸缩列，否则最后一列保持原宽度。
     """
     frame = ttk.Frame(parent)
     # The inner frame lets wide tables shrink to the available window width.
@@ -263,7 +289,7 @@ def make_tree(
     vsb.lift()
 
     layout = ([("#0", tree_heading, tree_width, "w")] if "tree" in show else []) + list(columns)
-    fixed_width = columns[-1][2] if len(columns) > 1 else 0
+    fixed_width = columns[-1][2] if len(columns) > 1 and not equal_columns and not expand_column else 0
     flexible = layout[:-1] if fixed_width else layout
     grow_index = next(
         (i for i, (col, _title, width, anchor) in enumerate(flexible)
@@ -279,7 +305,18 @@ def make_tree(
     def _fit_columns(event: Any) -> None:
         # The scrollbar covers the Treeview's right border; 2 px is its heading inset.
         available = max(1, event.width - vsb.winfo_reqwidth() + 2 - fixed_width)
-        if available >= desired_total:
+        if expand_column:
+            remaining = max(1, available - sum(
+                width for col, _title, width, _anchor in layout if col != expand_column
+            ))
+            for col, _title, width, _anchor in layout:
+                main.column(col, width=remaining if col == expand_column else width)
+            main.refresh_text()
+            return
+        if equal_columns:
+            widths = [available // len(flexible)] * len(flexible)
+            widths[-1] += available % len(flexible)
+        elif available >= desired_total:
             widths = desired.copy()
         elif available >= minimum_total:
             room = available - minimum_total
@@ -311,8 +348,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1180x760")
-        self.minsize(960, 620)
+        self.geometry(initial_window_geometry(self.winfo_screenwidth(), self.winfo_screenheight()))
+        self.minsize(min(960, self.winfo_screenwidth() - 40), min(620, self.winfo_screenheight() - 80))
 
         # ---- 后端对象 ----
         self.work_dir = Path.home() / ".file_organizer"
@@ -339,7 +376,6 @@ class App(tk.Tk):
         self.browser_paths: List[Path] = []
 
         self._setup_style()
-        self._build_menu()
         self._build_top_bar()
         self._build_bottom()  # 先占住底部空间，避免窗口较矮时日志区被挤掉
         self._build_notebook()
@@ -354,32 +390,134 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ #
     def _setup_style(self) -> None:
         style = ttk.Style(self)
-        theme = {"win32": "vista", "darwin": "aqua"}.get(sys.platform, "clam")
-        if theme in style.theme_names():
-            style.theme_use(theme)
+        style.theme_use("clam")
+        self.configure(background=BG)
         families = set(tkfont.families())
         for candidate in ("Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei"):
             if candidate in families:
                 for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
                     tkfont.nametofont(name).configure(family=candidate)
                 break
-        style.configure("Treeview", rowheight=24)
-        style.configure("Title.TLabel", font=(tkfont.nametofont("TkDefaultFont").actual("family"), 12, "bold"))
-        style.configure("Hint.TLabel", foreground="#666666")
-        style.configure("Danger.TButton", foreground="#b00020")
-        style.configure("Success.TLabel", foreground="#1b7f3a")
-        style.configure("Danger.TLabel", foreground="#b00020")
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            tkfont.nametofont(name).configure(size=11)
+        default_font = tkfont.nametofont("TkDefaultFont")
+        tkfont.nametofont("TkHeadingFont").configure(weight="bold")
+        style.configure(".", background=BG, foreground=TEXT, font=default_font)
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=TEXT)
+        style.configure("Title.TLabel", font=(default_font.actual("family"), 12, "bold"))
+        style.configure("Hint.TLabel", foreground=MUTED)
+        style.configure("Success.TLabel", foreground="#18794e")
+        style.configure("Danger.TLabel", foreground="#b42318")
+        style.configure("TLabelframe", background=BG, bordercolor=BORDER)
+        style.configure("TLabelframe.Label", background=BG, foreground=TEXT)
+        style.configure("TButton", background="#e9eef4", foreground=TEXT, bordercolor=BORDER,
+                        padding=(10, 5), relief="flat")
+        style.map("TButton", background=[("disabled", "#edf0f3"), ("pressed", ACCENT),
+                                         ("active", "#dce8f7")],
+                  foreground=[("disabled", "#89939e"), ("pressed", "#ffffff")],
+                  relief=[("pressed", "flat"), ("active", "flat")])
+        style.layout("TButton", [
+            ("Button.border", {"sticky": "nswe", "border": 1, "children": [
+                ("Button.padding", {"sticky": "nswe", "children": [
+                    ("Button.label", {"sticky": "nswe"}),
+                ]}),
+            ]}),
+        ])
+        style.configure("Danger.TButton", foreground="#b42318")
+        style.configure("TMenubutton", background="#e9eef4", foreground=TEXT, bordercolor=BORDER,
+                        padding=(10, 5), relief="flat")
+        style.map("TMenubutton", background=[("pressed", ACCENT), ("active", "#dce8f7")],
+                  foreground=[("pressed", "#ffffff")],
+                  relief=[("pressed", "flat"), ("active", "flat")])
+        style.configure("TopBar.TButton", padding=(4, 2))
+        style.configure("TopBar.TMenubutton", padding=(4, 2), anchor="center")
+        style.layout("TMenubutton", [
+            ("Menubutton.border", {"sticky": "nswe", "children": [
+                ("Menubutton.indicator", {"side": "right"}),
+                ("Menubutton.padding", {"sticky": "nswe", "children": [
+                    ("Menubutton.label", {"sticky": "nswe"}),
+                ]}),
+            ]}),
+        ])
+        style.configure("TEntry", fieldbackground=FIELD, foreground=TEXT, bordercolor=BORDER,
+                        insertcolor=TEXT, selectbackground=ACCENT, selectforeground="#ffffff", padding=4)
+        style.map("TEntry", fieldbackground=[("disabled", SURFACE)], foreground=[("disabled", MUTED)])
+        style.configure("TCombobox", fieldbackground=FIELD, background=FIELD, foreground=TEXT,
+                        arrowcolor=TEXT, bordercolor=BORDER, selectbackground=ACCENT,
+                        selectforeground="#ffffff", padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", FIELD), ("disabled", SURFACE)],
+                  foreground=[("disabled", MUTED)])
+        self.option_add("*TCombobox*Listbox.background", FIELD)
+        self.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", TEXT)
+
+        def check_image(selected: bool, disabled: bool) -> tk.PhotoImage:
+            image = tk.PhotoImage(master=self, width=16, height=16)
+            border = "#aeb8c4" if disabled else (ACCENT if selected else BORDER)
+            fill = "#d4d9df" if disabled and selected else (ACCENT if selected else FIELD)
+            image.put(border, to=(0, 0, 16, 16))
+            image.put(fill, to=(1, 1, 15, 15))
+            if selected:
+                for x, y in ((3, 8), (4, 9), (5, 10), (6, 9), (7, 8),
+                             (8, 7), (9, 6), (10, 5), (11, 4)):
+                    image.put("#ffffff", to=(x, y, x + 2, y + 2))
+            return image
+
+        unchecked = check_image(False, False)
+        checked = check_image(True, False)
+        unchecked_disabled = check_image(False, True)
+        checked_disabled = check_image(True, True)
+        self._checkbox_images = (unchecked, checked, unchecked_disabled, checked_disabled)
+        style.configure("TCheckbutton", background=BG, foreground=TEXT, space=4)
+        style.map("TCheckbutton", foreground=[("disabled", MUTED)])
+        style.layout("TCheckbutton", [
+            ("Checkbutton.padding", {"sticky": "nswe", "children": [
+                ("Checkbutton.label", {"sticky": "w"}),
+            ]}),
+        ])
+        style.configure("TNotebook", background=BG, bordercolor=BORDER)
+        style.configure("TNotebook.Tab", background="#e9eef4", foreground=TEXT,
+                        bordercolor=BORDER, padding=(12, 6), relief="flat")
+        style.map("TNotebook.Tab", background=[("selected", ACCENT), ("active", "#dce8f7")],
+                  foreground=[("selected", "#ffffff")],
+                  bordercolor=[("selected", ACCENT)],
+                  padding=[("selected", (12, 6)), ("active", (12, 6))],
+                  relief=[("selected", "flat"), ("active", "flat")])
+        style.layout("TNotebook.Tab", [
+            ("Notebook.tab", {"sticky": "nswe", "children": [
+                ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                    ("Notebook.label", {"side": "top"}),
+                ]}),
+            ]}),
+        ])
+        style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=TEXT,
+                        borderwidth=0, rowheight=max(26, default_font.metrics("linespace") + 8))
+        style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=SURFACE, foreground=TEXT, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, borderwidth=1, relief="solid")
+        style.map("Treeview.Heading", background=[("active", "#dce8f7")])
+        style.configure("TScrollbar", background="#c3ccd7", troughcolor=BG, arrowcolor=TEXT,
+                        bordercolor=BORDER)
+        style.configure("TProgressbar", background=ACCENT, troughcolor=SURFACE)
+
+    def _checkbutton(self, parent: tk.Misc, **kwargs: Any) -> ttk.Checkbutton:
+        unchecked, checked, unchecked_disabled, checked_disabled = self._checkbox_images
+        return ttk.Checkbutton(
+            parent, image=(str(unchecked), "disabled selected", str(checked_disabled),
+                           "disabled", str(unchecked_disabled), "selected", str(checked)),
+            compound="left", **kwargs,
+        )
 
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self)
-        tools = tk.Menu(menubar, tearoff=False)
+        tools = make_menu(self.tools_button)
         tools.add_command(label="打开工作目录", command=lambda: open_in_os(self.work_dir))
         tools.add_command(label="打开撤销日志目录", command=lambda: self._open_dir_safe(self.log_dir))
         tools.add_command(label="打开当前目录的回收站", command=self._open_trash)
         tools.add_separator()
         tools.add_command(label="退出", command=self.destroy)
-        menubar.add_cascade(label="工具", menu=tools)
-        self.configure(menu=menubar)
+        self.tools_button["menu"] = tools
 
     def _open_dir_safe(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
@@ -403,7 +541,11 @@ class App(tk.Tk):
         downloads = Path.home() / "Downloads"
         self.root_var = tk.StringVar(value=str(downloads if downloads.is_dir() else Path.home()))
         ttk.Entry(bar, textvariable=self.root_var).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(bar, text="浏览…", command=lambda: self._browse(self.root_var)).grid(row=0, column=2)
+        ttk.Button(bar, text="浏览…", width=6, style="TopBar.TButton",
+                   command=lambda: self._browse(self.root_var)).grid(row=0, column=2)
+        self.tools_button = ttk.Menubutton(bar, text="工具", width=6, style="TopBar.TMenubutton")
+        self.tools_button.grid(row=0, column=3, padx=(6, 0))
+        self._build_menu()
         ttk.Label(bar, text="额外排除的目录名（逗号分隔）：", style="Hint.TLabel").grid(
             row=1, column=0, sticky="w", pady=(4, 0)
         )
@@ -423,7 +565,12 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(status_row, mode="indeterminate", length=180)
         log_frame = ttk.Frame(bottom)
         log_frame.pack(fill="x")
-        self.log_text = tk.Text(log_frame, height=5, wrap="word", state="disabled", relief="solid", borderwidth=1)
+        self.log_text = tk.Text(
+            log_frame, height=2, wrap="word", state="disabled", relief="flat", borderwidth=0,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+            background=SURFACE, foreground=TEXT, insertbackground=TEXT, selectbackground=ACCENT,
+            selectforeground="#ffffff", font=tkfont.nametofont("TkTextFont"),
+        )
         log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(side="left", fill="x", expand=True)
@@ -624,7 +771,13 @@ class App(tk.Tk):
         self.browser_tree.bind("<<TreeviewSelect>>", self.browse_preview)
         self.browser_tree.bind("<Double-1>", self.browse_enter)
         preview_frame = ttk.Frame(panes)
-        self.browser_text = tk.Text(preview_frame, wrap="word", state="disabled")
+        self.browser_text = tk.Text(
+            preview_frame, wrap="word", state="disabled", relief="flat", borderwidth=0,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+            background=SURFACE, foreground=TEXT,
+            insertbackground=TEXT, selectbackground=ACCENT, selectforeground="#ffffff",
+            font=tkfont.nametofont("TkTextFont"),
+        )
         scrollbar = ttk.Scrollbar(preview_frame, command=self.browser_text.yview)
         self.browser_text.configure(yscrollcommand=scrollbar.set)
         self.browser_text.pack(side="left", fill="both", expand=True)
@@ -769,9 +922,9 @@ class App(tk.Tk):
         flags = ttk.Frame(tab)
         flags.pack(fill="x", pady=(6, 0))
         self.use_ai_var = tk.BooleanVar(value=bool(self.config.get("ai.enabled", True)))
-        ttk.Checkbutton(flags, text="启用 AI 补充分类（只发送文件名）", variable=self.use_ai_var).pack(side="left")
+        self._checkbutton(flags, text="启用 AI 补充分类（只发送文件名）", variable=self.use_ai_var).pack(side="left")
         self.org_dry_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(flags, text="仅模拟（不真正移动）", variable=self.org_dry_var).pack(side="left", padx=14)
+        self._checkbutton(flags, text="仅模拟（不真正移动）", variable=self.org_dry_var).pack(side="left", padx=14)
         ttk.Button(flags, text="生成预览", command=self.do_org_plan).pack(side="left", padx=(14, 0))
         ttk.Button(flags, text="运行选项", command=self.do_org_execute).pack(side="left", padx=6)
 
@@ -930,14 +1083,14 @@ class App(tk.Tk):
         self.dup_dry_var = tk.BooleanVar(value=False)
         ttk.Button(top, text="扫描重复文件", command=self.do_dup_find).pack(side="left")
         choose = ttk.Menubutton(top, text="选择方式")
-        choose_menu = tk.Menu(choose, tearoff=False)
+        choose_menu = make_menu(choose)
         choose_menu.add_command(label="每组保留最新，选其余副本", command=self._dup_auto_select)
         choose_menu.add_command(label="全选文件", command=self._dup_select_all)
         choose_menu.add_command(label="取消选择", command=self._dup_clear_selection)
         choose["menu"] = choose_menu
         choose.pack(side="left", padx=6)
         more = ttk.Menubutton(top, text="更多")
-        more_menu = tk.Menu(more, tearoff=False)
+        more_menu = make_menu(more)
         more_menu.add_checkbutton(label="包含 0 字节文件", variable=self.dup_empty_var)
         more_menu.add_checkbutton(label="仅模拟处理", variable=self.dup_dry_var)
         more_menu.add_command(label="定位所选文件", command=self._dup_reveal)
@@ -964,7 +1117,7 @@ class App(tk.Tk):
             height=14, show="tree headings", tree_heading="分组", tree_width=210,
         )
         frame.pack(fill="both", expand=True)
-        self.dup_tree.tag_configure("trash", foreground="#b00020")
+        self.dup_tree.tag_configure("trash", foreground="#b42318")
         self.dup_tree.bind("<Button-1>", self._dup_click, add="+")
 
     def do_dup_find(self) -> None:
@@ -1149,7 +1302,7 @@ class App(tk.Tk):
         top.pack(fill="x")
         ttk.Button(top, text="查找空文件夹", command=self.do_clean_find).pack(side="left")
         self.clean_dry_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="仅模拟", variable=self.clean_dry_var).pack(side="left", padx=12)
+        self._checkbutton(top, text="仅模拟", variable=self.clean_dry_var).pack(side="left", padx=12)
         ttk.Button(top, text="全选", command=lambda: self.clean_tree.selection_set(self.clean_tree.get_children())).pack(
             side="left", padx=(12, 0)
         )
@@ -1211,8 +1364,10 @@ class App(tk.Tk):
         top = ttk.Frame(tab)
         top.pack(fill="x")
         self.size_mode_var = tk.StringVar(value="最大")
-        ttk.Radiobutton(top, text="最大的文件", value="最大", variable=self.size_mode_var).pack(side="left")
-        ttk.Radiobutton(top, text="最小的文件", value="最小", variable=self.size_mode_var).pack(side="left", padx=8)
+        self._checkbutton(top, text="最大的文件", variable=self.size_mode_var,
+                          onvalue="最大", offvalue="最大").pack(side="left")
+        self._checkbutton(top, text="最小的文件", variable=self.size_mode_var,
+                          onvalue="最小", offvalue="最小").pack(side="left", padx=8)
         ttk.Label(top, text="数量：").pack(side="left", padx=(12, 0))
         self.size_top_var = tk.IntVar(value=int(self.config.get("clean.top_large_files", 10) or 10))
         ttk.Spinbox(top, from_=1, to=5000, width=7, textvariable=self.size_top_var).pack(side="left")
@@ -1230,7 +1385,7 @@ class App(tk.Tk):
                 ("mtime", "修改时间", 150, "center"),
                 ("path", "路径", 560, "w"),
             ],
-            height=14,
+            height=14, expand_column="path",
         )
         frame.pack(fill="both", expand=True)
         self.size_tree.bind("<Double-1>", lambda _e: self._size_reveal())
@@ -1422,15 +1577,16 @@ class App(tk.Tk):
         edit.pack(fill="x", pady=8)
         ttk.Label(edit, text="扩展名：").pack(side="left")
         self.rule_ext_var = tk.StringVar()
-        ttk.Entry(edit, textvariable=self.rule_ext_var, width=12).pack(side="left", padx=4)
+        ttk.Entry(edit, textvariable=self.rule_ext_var, width=8).pack(side="left", padx=4)
         ttk.Label(edit, text="归入：").pack(side="left", padx=(10, 0))
         self.rule_cat_var = tk.StringVar()
-        self.rule_cat_box = ttk.Combobox(edit, textvariable=self.rule_cat_var, width=16, values=self.config.categories)
+        self.rule_cat_box = ttk.Combobox(edit, textvariable=self.rule_cat_var, width=13,
+                                         values=self.config.categories)
         self.rule_cat_box.pack(side="left", padx=4)
         ttk.Button(edit, text="添加 / 更新", command=self._rule_apply).pack(side="left", padx=8)
         ttk.Button(edit, text="删除所选自定义规则", command=self._rule_delete).pack(side="left")
-        ttk.Button(edit, text="保存到配置文件", command=self._rules_save).pack(side="right")
-        ttk.Button(edit, text="重新载入", command=self.refresh_rules).pack(side="right", padx=6)
+        ttk.Button(edit, text="重新载入", command=self.refresh_rules).pack(side="left", padx=(6, 0))
+        ttk.Button(edit, text="保存到配置文件", command=self._rules_save).pack(side="left", padx=(6, 0))
 
         ttk.Label(
             tab,
@@ -1439,7 +1595,7 @@ class App(tk.Tk):
         ).pack(fill="x")
         frame, self.rules_tree = make_tree(
             tab, [("ext", "扩展名", 140, "w"), ("cat", "分类", 180, "w")],
-            height=14, selectmode="browse",
+            height=14, selectmode="browse", equal_columns=True,
         )
         frame.pack(fill="both", expand=True, pady=(6, 0))
         self.rules_tree.bind("<<TreeviewSelect>>", self._rule_pick)
@@ -1530,7 +1686,7 @@ class App(tk.Tk):
     # 页签 9：设置（AI / 安全）
     # ------------------------------------------------------------------ #
     def _build_settings_tab(self, tab: ttk.Frame) -> None:
-        ai = ttk.LabelFrame(tab, text="AI 分类（只发送文件名，不发送文件内容）", padding=10)
+        ai = ttk.LabelFrame(tab, text="AI 分类（只发送文件名，不发送文件内容）", padding=4)
         ai.pack(fill="x")
 
         # -- 共享设置（启用开关 + 批量 / 超时参数，三个服务商通用） -------- #
@@ -1544,20 +1700,26 @@ class App(tk.Tk):
             "max_files": tk.StringVar(),
             "timeout": tk.StringVar(),
         }
-        ttk.Checkbutton(ai, text="启用 AI 补充分类", variable=self.ai_vars["enabled"]).grid(
-            row=0, column=0, columnspan=3, sticky="w"
+        self._checkbutton(ai, text="启用 AI 补充分类", variable=self.ai_vars["enabled"]).grid(
+            row=0, column=0, sticky="w"
         )
 
         # -- 服务商选择：切换后下面的模型 / 连接信息整体跟着切换 --------- #
-        ttk.Label(ai, text="AI 服务商：").grid(row=1, column=0, sticky="w", pady=2)
+        provider_row = ttk.Frame(ai)
+        provider_row.grid(row=1, column=0, sticky="ew", pady=1)
+        provider_row.columnconfigure(0, weight=1, uniform="setting")
+        provider_row.columnconfigure(1, weight=1, uniform="setting")
+        provider_field = ttk.Frame(provider_row)
+        provider_field.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(provider_field, text="AI 服务商：").pack(side="left")
         self._provider_labels = [PROVIDER_INFO[pid]["label"] for pid in PROVIDER_ORDER]
         self._label_to_provider = {PROVIDER_INFO[pid]["label"]: pid for pid in PROVIDER_ORDER}
         self.ai_provider_label_var = tk.StringVar()
         provider_combo = ttk.Combobox(
-            ai, textvariable=self.ai_provider_label_var, values=self._provider_labels,
+            provider_field, textvariable=self.ai_provider_label_var, values=self._provider_labels,
             state="readonly", width=20,
         )
-        provider_combo.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        provider_combo.pack(side="left", fill="x", expand=True, padx=(4, 0))
         provider_combo.bind("<<ComboboxSelected>>", self._on_ai_provider_changed)
         self._current_ai_provider = PROVIDER_ORDER[0]
         # 每个服务商各自的 model / base_url / api_key / api_key_env，内存中保留，
@@ -1565,35 +1727,51 @@ class App(tk.Tk):
         self._ai_provider_cache: Dict[str, Dict[str, str]] = {}
 
         # -- 模型：下拉可编辑（允许手填模型 ID），旁边一个“获取模型列表” --- #
-        ttk.Label(ai, text="模型：").grid(row=2, column=0, sticky="w", pady=2)
-        self.ai_model_combo = ttk.Combobox(ai, textvariable=self.ai_vars["model"], width=34)
-        self.ai_model_combo.grid(row=2, column=1, sticky="ew", padx=6, pady=2)
-        self.ai_fetch_models_btn = ttk.Button(ai, text="获取模型列表", command=self.fetch_ai_models)
-        self.ai_fetch_models_btn.grid(row=2, column=2, sticky="w")
+        model_controls = ttk.Frame(provider_row)
+        model_controls.grid(row=0, column=1, sticky="ew")
+        ttk.Label(model_controls, text="模型：").pack(side="left")
+        self.ai_model_combo = ttk.Combobox(model_controls, textvariable=self.ai_vars["model"], width=18)
+        self.ai_model_combo.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.ai_fetch_models_btn = ttk.Button(model_controls, text="获取模型列表", command=self.fetch_ai_models)
+        self.ai_fetch_models_btn.pack(side="left", padx=(4, 0))
 
         fields = [
             ("base_url", "Base URL（留空＝官方地址）"), ("api_key", "API Key"),
             ("api_key_env", "API Key 环境变量名"), ("batch_size", "每批文件数（≤20）"),
             ("max_files", "最多送 AI 的文件数"), ("timeout", "超时（秒）"),
         ]
-        for row, (key, label) in enumerate(fields, start=3):
-            ttk.Label(ai, text=label + "：").grid(row=row, column=0, sticky="w", pady=2)
-            entry = ttk.Entry(ai, textvariable=self.ai_vars[key], show="•" if key == "api_key" else "")
-            entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=2)
-        ai.columnconfigure(1, weight=1)
+        for row, (key, label) in enumerate(fields[:2], start=2):
+            line = ttk.Frame(ai)
+            line.grid(row=row, column=0, sticky="ew", pady=1)
+            ttk.Label(line, text=label + "：").pack(side="left")
+            ttk.Entry(line, textvariable=self.ai_vars[key], show="•" if key == "api_key" else "").pack(
+                side="left", fill="x", expand=True, padx=(4, 0)
+            )
+        for row in (4, 5):
+            line = ttk.Frame(ai)
+            line.grid(row=row, column=0, sticky="ew", pady=1)
+            line.columnconfigure(0, weight=1, uniform="setting")
+            line.columnconfigure(1, weight=1, uniform="setting")
+            for column, (key, label) in enumerate(fields[2 + (row - 4) * 2:4 + (row - 4) * 2]):
+                field = ttk.Frame(line)
+                field.grid(row=0, column=column, sticky="ew", padx=(0, 8) if column == 0 else 0)
+                ttk.Label(field, text=label + "：").pack(side="left")
+                ttk.Entry(field, textvariable=self.ai_vars[key]).pack(
+                    side="left", fill="x", expand=True, padx=(4, 0)
+                )
+        ai.columnconfigure(0, weight=1)
 
-        hint_row = 3 + len(fields)
+        hint_row = 6
         hint_text = (
-            "安全提示：API Key 写进配置文件是明文保存，推荐只设置环境变量（环境变量优先于这里的值）。"
-            "切换服务商不会丢失其他服务商已填写的信息，保存设置时一并写入。"
+            "安全提示：API Key 在配置文件中明文保存，建议使用环境变量；保存时会保留各服务商设置。"
         )
         ttk.Label(ai, text=hint_text, style="Hint.TLabel", wraplength=900, justify="left").grid(
-            row=hint_row, column=0, columnspan=3, sticky="w", pady=(4, 0)
+            row=hint_row, column=0, sticky="w", pady=(3, 0)
         )
 
         # -- 测试连接：后台线程执行，避免卡界面 / 重复点击 ----------------- #
         test_row = ttk.Frame(ai)
-        test_row.grid(row=hint_row + 1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        test_row.grid(row=hint_row + 1, column=0, sticky="ew", pady=(3, 0))
         self.ai_test_btn = ttk.Button(test_row, text="测试连接", command=self.test_ai_connection)
         self.ai_test_btn.pack(side="left")
         ttk.Label(test_row, text="（测试会发送一次最小请求，消耗少量 API 额度）", style="Hint.TLabel").pack(
@@ -1603,17 +1781,19 @@ class App(tk.Tk):
         self.ai_test_result_label = ttk.Label(
             ai, textvariable=self.ai_test_result_var, justify="left", wraplength=900,
         )
-        self.ai_test_result_label.grid(row=hint_row + 2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.ai_test_result_label.grid(row=hint_row + 2, column=0, sticky="w", pady=(2, 0))
 
-        scan = ttk.LabelFrame(tab, text="扫描与安全", padding=10)
-        scan.pack(fill="x", pady=8)
+        scan = ttk.LabelFrame(tab, text="扫描与安全", padding=4)
+        scan.pack(fill="x", pady=(4, 4))
         self.excl_names_var = tk.StringVar()
         self.follow_var = tk.BooleanVar()
         self.confirm_var = tk.BooleanVar()
         ttk.Label(scan, text="始终排除的目录名（逗号分隔）：").grid(row=0, column=0, sticky="w")
         ttk.Entry(scan, textvariable=self.excl_names_var).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Checkbutton(scan, text="扫描时跟随符号链接", variable=self.follow_var).grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Checkbutton(scan, text="删除类操作需要输入 DELETE 确认", variable=self.confirm_var).grid(
+        self._checkbutton(scan, text="扫描时跟随符号链接", variable=self.follow_var).grid(
+            row=1, column=0, sticky="w", pady=1
+        )
+        self._checkbutton(scan, text="删除类操作需要输入 DELETE 确认", variable=self.confirm_var).grid(
             row=1, column=1, sticky="w"
         )
         scan.columnconfigure(1, weight=1)
