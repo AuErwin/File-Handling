@@ -133,3 +133,17 @@ def test_find_hashes_only_files_with_matching_sizes(
 
     assert len(groups) == 1
     assert set(hashed) == set(matching)
+
+
+def test_find_orders_groups_by_recoverable_space(tmp_path: Path) -> None:
+    small_copies = [tmp_path / f"small-{index}.txt" for index in range(3)]
+    large_copies = [tmp_path / f"large-{index}.txt" for index in range(2)]
+    for path in small_copies:
+        path.write_bytes(b"small")
+    for path in large_copies:
+        path.write_bytes(b"12345678")
+
+    groups = DuplicateChecker([_info(path) for path in large_copies + small_copies]).find()
+
+    assert [group.recoverable_bytes for group in groups] == [10, 8]
+    assert {item.path for item in groups[0].files} == set(small_copies)
