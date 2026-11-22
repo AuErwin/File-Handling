@@ -1,9 +1,13 @@
 """Tests for :mod:`file_organizer.duplicate_checker`."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
+import pytest
+
+from file_organizer import duplicate_checker
 from file_organizer.duplicate_checker import DuplicateChecker
 from file_organizer.models import FileInfo
 
@@ -80,3 +84,52 @@ def test_summarize_reports_wasted_bytes(tmp_path: Path) -> None:
     assert summary["files"] == 2
     assert summary["redundant"] == 1
     assert summary["wasted_bytes"] == 4
+
+
+def test_find_ignores_file_removed_after_scan(tmp_path: Path) -> None:
+    paths = [tmp_path / name for name in ("a.txt", "b.txt", "c.txt")]
+    for path in paths:
+        path.write_bytes(b"same")
+    files = [_info(path) for path in paths]
+    paths[2].unlink()
+
+    groups = DuplicateChecker(files).find()
+
+    assert len(groups) == 1
+    assert {item.path for item in groups[0].files} == set(paths[:2])
+
+
+def test_find_places_newest_duplicate_first(tmp_path: Path) -> None:
+    old = tmp_path / "old.txt"
+    new = tmp_path / "new.txt"
+    for path in (old, new):
+        path.write_bytes(b"same")
+    os.utime(old, (1700000000, 1700000000))
+    os.utime(new, (1700000100, 1700000100))
+
+    groups = DuplicateChecker([_info(old), _info(new)]).find()
+
+    assert [item.path for item in groups[0].files] == [new, old]
+
+
+def test_find_hashes_only_files_with_matching_sizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matching = [tmp_path / "a.txt", tmp_path / "b.txt"]
+    unique = tmp_path / "unique.txt"
+    for path in matching:
+        path.write_bytes(b"same")
+    unique.write_bytes(b"different length")
+    hashed: List[Path] = []
+    original_hash = duplicate_checker.chunked_hash
+
+    def record_hash(path: Path, algorithm: str, chunk_size: int) -> Optional[str]:
+        hashed.append(path)
+        return original_hash(path, algorithm, chunk_size)
+
+    monkeypatch.setattr(duplicate_checker, "chunked_hash", record_hash)
+
+    groups = DuplicateChecker([_info(path) for path in matching + [unique]]).find()
+
+    assert len(groups) == 1
+    assert set(hashed) == set(matching)
